@@ -1,0 +1,12 @@
+# /etc/logrotate.d/myapp-logrotate
+/var/log/myapp/app.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    postrotate
+        kill -HUP $(cat /var/run/myapp.pid)
+    endscript
+}
