@@ -1,3 +1,5 @@
+use crate::config::{ActiveConfig, DEFAULT_LOG_FORMAT, LogFormat};
+
 use super::*;
 use log::{Level, LevelFilter, Record};
 
@@ -94,47 +96,27 @@ fn thread_name_placeholder_renders() {
 
 #[test]
 fn level_for_prefers_more_specific_target_filter() {
-    let mut filters = vec![
-        TargetFilter {
-            target: "app".to_string(),
-            level: LevelFilter::Warn,
-        },
-        TargetFilter {
-            target: "app::sub".to_string(),
-            level: LevelFilter::Debug,
-        },
-    ];
-    filters.sort_unstable_by(|a, b| b.target.len().cmp(&a.target.len()));
+    let cfg = ActiveConfig::from_reload(
+        MinimalLoggerConfig::new()
+            .level(LevelFilter::Info)
+            .filter("app", LevelFilter::Warn)
+            .filter("app::sub", LevelFilter::Debug)
+            .into_reload(None),
+    );
 
-    let logger = MinimalLogger {
-        default_level: LevelFilter::Info,
-        filters,
-        file_path: None,
-        buf_capacity: DEFAULT_BUF_CAPACITY,
-        flush_ms: DEFAULT_FLUSH_MS,
-        format: LogFormat::parse(DEFAULT_LOG_FORMAT),
-        file: ArcSwapOption::new(None),
-    };
-
-    assert_eq!(logger.level_for("app::sub::worker"), LevelFilter::Debug);
-    assert_eq!(logger.level_for("app::other"), LevelFilter::Warn);
-    assert_eq!(logger.level_for("other"), LevelFilter::Info);
+    assert_eq!(cfg.level_for("app::sub::worker"), LevelFilter::Debug);
+    assert_eq!(cfg.level_for("app::other"), LevelFilter::Warn);
+    assert_eq!(cfg.level_for("other"), LevelFilter::Info);
 }
 
 #[test]
 fn enabled_respects_target_filter_levels() {
-    let logger = MinimalLogger {
-        default_level: LevelFilter::Info,
-        filters: vec![TargetFilter {
-            target: "app::sub".to_string(),
-            level: LevelFilter::Debug,
-        }],
-        file_path: None,
-        buf_capacity: DEFAULT_BUF_CAPACITY,
-        flush_ms: DEFAULT_FLUSH_MS,
-        format: LogFormat::parse(DEFAULT_LOG_FORMAT),
-        file: ArcSwapOption::new(None),
-    };
+    let cfg = ActiveConfig::from_reload(
+        MinimalLoggerConfig::new()
+            .level(LevelFilter::Info)
+            .filter("app::sub", LevelFilter::Debug)
+            .into_reload(None),
+    );
 
     let record = Record::builder()
         .args(format_args!("ok"))
@@ -145,7 +127,7 @@ fn enabled_respects_target_filter_levels() {
         .line(Some(1))
         .build();
 
-    assert!(logger.enabled(record.metadata()));
+    assert!(record.metadata().level() <= cfg.level_for(record.metadata().target()));
 
     let record = Record::builder()
         .args(format_args!("ok"))
@@ -156,5 +138,5 @@ fn enabled_respects_target_filter_levels() {
         .line(Some(1))
         .build();
 
-    assert!(!logger.enabled(record.metadata()));
+    assert!(record.metadata().level() > cfg.level_for(record.metadata().target()));
 }
