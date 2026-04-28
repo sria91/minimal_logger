@@ -84,7 +84,7 @@ impl ActiveConfig {
 /// Builder for logger configuration.
 ///
 /// Construct with [`MinimalLoggerConfig::new()`] (or [`Default::default()`]) for fully
-/// programmatic configuration, or with [`config_from_env()`] to seed the config from
+/// programmatic configuration, or with [`MinimalLoggerConfig::from_env()`] to seed the config from
 /// the standard `RUST_LOG*` environment variables. Chain builder methods to set or
 /// override individual settings, then pass the result to [`init()`] or [`reinit()`].
 ///
@@ -259,6 +259,87 @@ impl MinimalLoggerConfig {
         self.format.as_deref()
     }
 
+    /// Build a [`MinimalLoggerConfig`] from the standard `RUST_LOG*` environment variables.
+    ///
+    /// This is the only public API surface that reads environment variables. The
+    /// returned config can be inspected or further modified with builder methods before
+    /// being passed to [`init()`] or [`reinit()`].
+    ///
+    /// | Variable               | Description                                          |
+    /// |------------------------|------------------------------------------------------|
+    /// | `RUST_LOG`             | Global level and optional `target=level` overrides   |
+    /// | `RUST_LOG_FILE`        | Path to the log file (omit for stderr output)        |
+    /// | `RUST_LOG_BUFFER_SIZE` | Per-thread `BufWriter` capacity in bytes             |
+    /// | `RUST_LOG_FLUSH_MS`    | Periodic flush interval in milliseconds              |
+    /// | `RUST_LOG_FORMAT`      | Log-line template with `{field}` placeholders        |
+    ///
+    /// When `RUST_LOG` is unset it defaults to `info`. All other variables, when absent
+    /// or unparseable, leave the corresponding builder field as `None`: on [`init()`]
+    /// that resolves to the compile-time default (4096 B buffer, 1 s flush, built-in
+    /// format, stderr output); on [`reinit()`] it preserves the currently active value.
+    /// Invalid `RUST_LOG` directives are skipped with a warning on stderr.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// // Read env vars, then override the level programmatically before init.
+    /// let config = minimal_logger::MinimalLoggerConfig::from_env()
+    ///     .level(log::LevelFilter::Debug);
+    /// minimal_logger::init(config).expect("logger init failed");
+    /// ```
+    pub fn from_env() -> MinimalLoggerConfig {
+        let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+
+        let file = std::env::var("RUST_LOG_FILE")
+            .ok()
+            .map(|path| FileTarget::Path(PathBuf::from(path)));
+
+        let buf_capacity = std::env::var("RUST_LOG_BUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok());
+
+        let flush_ms = std::env::var("RUST_LOG_FLUSH_MS")
+            .ok()
+            .and_then(|s| s.parse().ok());
+
+        let format = std::env::var("RUST_LOG_FORMAT").ok();
+
+        let mut level: Option<LevelFilter> = None;
+        let mut filters: Vec<(String, LevelFilter)> = Vec::new();
+
+        for directive in rust_log.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match directive.split_once('=') {
+                Some((target, level_str)) => match level_str.trim().parse::<LevelFilter>() {
+                    Ok(l) => filters.push((target.trim().to_string(), l)),
+                    Err(_) => eprintln!(
+                        "[minimal_logger] RUST_LOG: unknown level {:?} — skipping",
+                        level_str
+                    ),
+                },
+                None => match directive.parse::<LevelFilter>() {
+                    Ok(l) => level = Some(l),
+                    Err(_) => eprintln!(
+                        "[minimal_logger] RUST_LOG: unknown directive {:?} — skipping",
+                        directive
+                    ),
+                },
+            }
+        }
+
+        MinimalLoggerConfig {
+            level,
+            filters: if filters.is_empty() {
+                None
+            } else {
+                Some(filters)
+            },
+            file,
+            buf_capacity,
+            flush_ms,
+            format,
+        }
+    }
+
     /// Convert this builder into a [`ReloadConfig`], merging with `current`.
     ///
     /// Each unset field inherits from `current` when `Some`, or falls back to
@@ -312,89 +393,19 @@ impl MinimalLoggerConfig {
     }
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  COMMON: Environment-variable configuration reader
-// ═════════════════════════════════════════════════════════════════════════════
-
 /// Build a [`MinimalLoggerConfig`] from the standard `RUST_LOG*` environment variables.
 ///
-/// This is the only public API surface that reads environment variables. The
-/// returned config can be inspected or further modified with builder methods before
-/// being passed to [`init()`] or [`reinit()`].
-///
-/// | Variable               | Description                                          |
-/// |------------------------|------------------------------------------------------|
-/// | `RUST_LOG`             | Global level and optional `target=level` overrides   |
-/// | `RUST_LOG_FILE`        | Path to the log file (omit for stderr output)        |
-/// | `RUST_LOG_BUFFER_SIZE` | Per-thread `BufWriter` capacity in bytes             |
-/// | `RUST_LOG_FLUSH_MS`    | Periodic flush interval in milliseconds              |
-/// | `RUST_LOG_FORMAT`      | Log-line template with `{field}` placeholders        |
-///
-/// When `RUST_LOG` is unset it defaults to `info`. All other variables, when absent
-/// or unparseable, leave the corresponding builder field as `None`: on [`init()`]
-/// that resolves to the compile-time default (4096 B buffer, 1 s flush, built-in
-/// format, stderr output); on [`reinit()`] it preserves the currently active value.
-/// Invalid `RUST_LOG` directives are skipped with a warning on stderr.
+/// This is a convenience free function that delegates to
+/// [`MinimalLoggerConfig::from_env()`]. Prefer calling the associated function
+/// directly; this wrapper is retained for backward compatibility.
 ///
 /// # Example
 ///
 /// ```rust,no_run
-/// // Read env vars, then override the level programmatically before init.
-/// let config = minimal_logger::config_from_env()
-///     .level(log::LevelFilter::Debug);
-/// minimal_logger::init(config).expect("logger init failed");
+/// minimal_logger::init(minimal_logger::config_from_env()).expect("logger init failed");
 /// ```
 pub fn config_from_env() -> MinimalLoggerConfig {
-    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-
-    let file = std::env::var("RUST_LOG_FILE")
-        .ok()
-        .map(|path| FileTarget::Path(PathBuf::from(path)));
-
-    let buf_capacity = std::env::var("RUST_LOG_BUFFER_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok());
-
-    let flush_ms = std::env::var("RUST_LOG_FLUSH_MS")
-        .ok()
-        .and_then(|s| s.parse().ok());
-
-    let format = std::env::var("RUST_LOG_FORMAT").ok();
-
-    let mut level: Option<LevelFilter> = None;
-    let mut filters: Vec<(String, LevelFilter)> = Vec::new();
-
-    for directive in rust_log.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        match directive.split_once('=') {
-            Some((target, level_str)) => match level_str.trim().parse::<LevelFilter>() {
-                Ok(l) => filters.push((target.trim().to_string(), l)),
-                Err(_) => eprintln!(
-                    "[minimal_logger] RUST_LOG: unknown level {:?} — skipping",
-                    level_str
-                ),
-            },
-            None => match directive.parse::<LevelFilter>() {
-                Ok(l) => level = Some(l),
-                Err(_) => eprintln!(
-                    "[minimal_logger] RUST_LOG: unknown directive {:?} — skipping",
-                    directive
-                ),
-            },
-        }
-    }
-
-    MinimalLoggerConfig {
-        level,
-        filters: if filters.is_empty() {
-            None
-        } else {
-            Some(filters)
-        },
-        file,
-        buf_capacity,
-        flush_ms,
-        format,
-    }
+    MinimalLoggerConfig::from_env()
 }
 
 /// A single `target=level` directive parsed from the `RUST_LOG` environment variable.
