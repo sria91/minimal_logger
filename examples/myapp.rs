@@ -20,7 +20,8 @@ mod net {
 }
 
 fn main() {
-    minimal_logger::init(minimal_logger::config_from_env()).expect("Logger init failed");
+    minimal_logger::init(minimal_logger::MinimalLoggerConfig::from_env())
+        .expect("Logger init failed");
 
     trace!("main: trace");
     debug!("main: debug");

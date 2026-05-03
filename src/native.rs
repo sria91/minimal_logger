@@ -1,12 +1,22 @@
 // ═════════════════════════════════════════════════════════════════════════════
-//  PLATFORM: LINUX
+//  PLATFORM: Unix (Linux, macOS, and other Unix-like systems)
+//
+//  All three Unix variants share an identical SIGHUP handler and sigaction
+//  registration.  Only `sync_file` differs — macOS requires F_FULLFSYNC to
+//  flush through the disk controller cache, Linux uses fdatasync, and the
+//  generic fallback uses plain fsync.
 // ═════════════════════════════════════════════════════════════════════════════
-#[cfg(target_os = "linux")]
-pub(crate) mod platform {
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Shared Unix signal handler and sigaction registration
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(unix)]
+mod unix_signal {
     use crate::REOPEN_FLAG;
     use std::sync::atomic::Ordering;
 
-    extern "C" fn sighup_handler(_: libc::c_int) {
+    pub(super) extern "C" fn sighup_handler(_: libc::c_int) {
+        // Signal-safe: only stores to an AtomicBool.
         REOPEN_FLAG.store(true, Ordering::Relaxed);
     }
 
@@ -14,7 +24,7 @@ pub(crate) mod platform {
     ///
     /// Uses `SA_RESTART` so that slow syscalls interrupted by the signal are
     /// automatically restarted instead of failing with `EINTR`.
-    pub fn register_rotation_handler() {
+    pub(super) fn register_sighup() {
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = sighup_handler as *const () as libc::sighandler_t;
@@ -23,56 +33,58 @@ pub(crate) mod platform {
             if libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut()) != 0 {
                 eprintln!("[minimal_logger] sigaction(SIGHUP) failed — rotation disabled");
             }
-        }
-    }
-
-    /// Sync file data to block storage, skipping metadata (`fdatasync`).
-    pub fn sync_file(file: &std::fs::File) {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::fdatasync(file.as_raw_fd());
         }
     }
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  PLATFORM: macOS
-//
-//  F_FULLFSYNC required — plain fsync() only reaches the controller cache.
-// ═════════════════════════════════════════════════════════════════════════════
-#[cfg(target_os = "macos")]
+// ─────────────────────────────────────────────────────────────────────────────
+//  Linux platform module
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(target_os = "linux")]
 pub(crate) mod platform {
-    use crate::REOPEN_FLAG;
-    use std::sync::atomic::Ordering;
+    use super::unix_signal;
 
-    extern "C" fn sighup_handler(_: libc::c_int) {
-        REOPEN_FLAG.store(true, Ordering::Relaxed);
+    pub fn register_rotation_handler() {
+        unix_signal::register_sighup();
     }
 
-    /// Register the `SIGHUP` handler via `sigaction(2)`.
+    /// Sync file data to block storage, skipping metadata (`fdatasync`).
     ///
-    /// Uses `SA_RESTART` so that slow syscalls interrupted by the signal are
-    /// automatically restarted instead of failing with `EINTR`.
-    pub fn register_rotation_handler() {
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = sighup_handler as *const () as libc::sighandler_t;
-            sa.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut sa.sa_mask);
-            if libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut()) != 0 {
-                eprintln!("[minimal_logger] sigaction(SIGHUP) failed — rotation disabled");
-            }
+    /// Logs a warning if `fdatasync` fails.
+    pub fn sync_file(file: &std::fs::File) {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::fdatasync(file.as_raw_fd()) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("[minimal_logger] fdatasync failed: {err}");
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  macOS platform module
+//
+//  F_FULLFSYNC required — plain fsync() only reaches the controller cache.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(target_os = "macos")]
+pub(crate) mod platform {
+    use super::unix_signal;
+
+    pub fn register_rotation_handler() {
+        unix_signal::register_sighup();
     }
 
     /// Sync file data through the disk controller cache (`F_FULLFSYNC`).
     ///
     /// Plain `fsync` on macOS only reaches the controller write cache.
     /// `F_FULLFSYNC` guarantees the data reaches physical media.
+    /// Logs a warning if `fcntl(F_FULLFSYNC)` fails.
     pub fn sync_file(file: &std::fs::File) {
         use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC);
+        let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("[minimal_logger] F_FULLFSYNC failed: {err}");
         }
     }
 }
@@ -92,14 +104,22 @@ pub(crate) mod platform {
     use windows::core::PCWSTR;
 
     /// Encode a UTF-8 string as a null-terminated UTF-16 sequence for Win32 APIs.
+    ///
+    /// Unlike a raw `encode_utf16().collect()`, this function appends the
+    /// required `0u16` sentinel so callers do not need to embed `\0` in string
+    /// literals (which is error-prone and hard to audit).
     fn to_wide_null(s: &str) -> Vec<u16> {
-        s.encode_utf16().collect()
+        s.encode_utf16().chain(std::iter::once(0u16)).collect()
     }
 
-    /// Spawn a background thread that waits on the `Global\\RustLogger_LogRotate`
+    /// Spawn a background thread that waits on the `Local\RustLogger_LogRotate`
     /// named event and sets `REOPEN_FLAG` whenever the event fires.
+    ///
+    /// The event is placed in the session-local (`Local\`) namespace rather than
+    /// `Global\` to prevent processes in other user sessions from triggering an
+    /// unintended log-file rotation.
     pub fn register_rotation_handler() {
-        let name = to_wide_null("Global\\RustLogger_LogRotate\0");
+        let name = to_wide_null("Local\\RustLogger_LogRotate");
         let _ = std::thread::Builder::new()
             .name("logger-rotation-watcher".into())
             .stack_size(64 * 1024)
@@ -120,40 +140,36 @@ pub(crate) mod platform {
     }
 
     /// Flush the OS write buffer for `file` to disk (`FlushFileBuffers`).
+    ///
+    /// Logs a warning if `FlushFileBuffers` fails.
     pub fn sync_file(file: &std::fs::File) {
         use std::os::windows::io::AsRawHandle;
-        let _ = unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) };
+        if let Err(e) = unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) } {
+            eprintln!("[minimal_logger] FlushFileBuffers failed: {e}");
+        }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Fallback: other Unix-like platforms
+//  Fallback: other Unix-like platforms (not Linux, not macOS)
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
 pub(crate) mod platform {
-    use crate::REOPEN_FLAG;
-    use std::sync::atomic::Ordering;
+    use super::unix_signal;
 
-    extern "C" fn sighup_handler(_: libc::c_int) {
-        REOPEN_FLAG.store(true, Ordering::Relaxed);
-    }
-
-    /// Register the `SIGHUP` handler via `sigaction(2)` on other Unix-like platforms.
     pub fn register_rotation_handler() {
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = sighup_handler as libc::sighandler_t;
-            sa.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
-        }
+        unix_signal::register_sighup();
     }
 
     /// Sync file data to disk (`fsync`).
+    ///
+    /// Logs a warning if `fsync` fails.
     pub fn sync_file(file: &std::fs::File) {
         use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::fsync(file.as_raw_fd());
+        let ret = unsafe { libc::fsync(file.as_raw_fd()) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("[minimal_logger] fsync failed: {err}");
         }
     }
 }

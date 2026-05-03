@@ -1,4 +1,6 @@
+use std::fmt::Write;
 use std::path::{PathBuf, absolute};
+use std::sync::OnceLock;
 
 use log::{LevelFilter, Record};
 use time::OffsetDateTime;
@@ -362,7 +364,19 @@ impl MinimalLoggerConfig {
         };
 
         let file_path = match self.file {
-            Some(FileTarget::Path(p)) => Some(absolute(&p).unwrap_or(p).display().to_string()),
+            Some(FileTarget::Path(p)) => {
+                let abs = match absolute(&p) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!(
+                            "[minimal_logger] Could not resolve absolute path for {:?}: {e} — using path as-is",
+                            p
+                        );
+                        p
+                    }
+                };
+                Some(abs.display().to_string())
+            }
             Some(FileTarget::Stderr) => None,
             None => current.and_then(|c| c.file_path.clone()),
         };
@@ -396,14 +410,23 @@ impl MinimalLoggerConfig {
 /// Build a [`MinimalLoggerConfig`] from the standard `RUST_LOG*` environment variables.
 ///
 /// This is a convenience free function that delegates to
-/// [`MinimalLoggerConfig::from_env()`]. Prefer calling the associated function
-/// directly; this wrapper is retained for backward compatibility.
+/// [`MinimalLoggerConfig::from_env()`].
+///
+/// # Deprecation
+///
+/// Prefer calling [`MinimalLoggerConfig::from_env()`] directly. This free
+/// function is retained for backward compatibility and will be removed in a
+/// future major version.
 ///
 /// # Example
 ///
 /// ```rust,no_run
 /// minimal_logger::init(minimal_logger::config_from_env()).expect("logger init failed");
 /// ```
+#[deprecated(
+    since = "0.3.0",
+    note = "Use `MinimalLoggerConfig::from_env()` instead"
+)]
 pub fn config_from_env() -> MinimalLoggerConfig {
     MinimalLoggerConfig::from_env()
 }
@@ -412,29 +435,13 @@ pub fn config_from_env() -> MinimalLoggerConfig {
 ///
 /// Directives are sorted by decreasing `target` length before matching so that
 /// the most specific prefix always wins.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct TargetFilter {
     /// Module or crate path prefix matched against `record.target()`.
-    target: String,
+    pub(crate) target: String,
     /// Maximum level to emit for records whose target starts with `self.target`.
-    level: LevelFilter,
+    pub(crate) level: LevelFilter,
 }
-
-impl Clone for TargetFilter {
-    fn clone(&self) -> Self {
-        Self {
-            target: self.target.clone(),
-            level: self.level,
-        }
-    }
-}
-
-impl PartialEq for TargetFilter {
-    fn eq(&self, other: &Self) -> bool {
-        self.target == other.target && self.level == other.level
-    }
-}
-
-impl Eq for TargetFilter {}
 
 /// Horizontal alignment direction for a fixed-width format field.
 #[derive(Clone, Copy)]
@@ -555,6 +562,8 @@ impl LogFormat {
 
     /// Render a log [`Record`] against this template into a complete log line.
     ///
+    /// All field values are written directly into `output` without intermediate
+    /// `String` heap allocations — only the final output buffer is allocated.
     /// Appends a trailing `'\n'` if the rendered string does not already end
     /// with one.
     pub(crate) fn render(&self, record: &Record) -> String {
@@ -564,8 +573,7 @@ impl LogFormat {
             match piece {
                 FormatPiece::Literal(text) => output.push_str(text),
                 FormatPiece::Placeholder { field, spec } => {
-                    let raw = render_field(*field, record);
-                    output.push_str(&apply_format_spec(&raw, *spec));
+                    write_field(&mut output, *field, *spec, record);
                 }
             }
         }
@@ -632,59 +640,91 @@ fn parse_format_spec(spec: &str) -> FormatSpec {
     }
 }
 
-/// Render a single [`LogField`] from `record` to a heap-allocated string.
-fn render_field(field: LogField, record: &Record) -> String {
+/// Cached timestamp `FormatDescription` — parsed once, reused on every log call.
+static TIMESTAMP_FMT: OnceLock<time::format_description::OwnedFormatItem> = OnceLock::new();
+
+/// Write a single [`LogField`] into `out`, applying `spec` padding inline.
+///
+/// Writing directly into `out` avoids the intermediate `String` that the old
+/// `render_field` + `apply_format_spec` pair produced per placeholder.
+fn write_field(out: &mut String, field: LogField, spec: FormatSpec, record: &Record) {
+    // Helper: write `value` str with padding applied.
+    fn write_padded(out: &mut String, value: &str, spec: FormatSpec) {
+        match spec.width {
+            Some(w) if value.len() < w => {
+                let pad = w - value.len();
+                match spec.align {
+                    Align::Left => {
+                        out.push_str(value);
+                        for _ in 0..pad {
+                            out.push(' ');
+                        }
+                    }
+                    Align::Right => {
+                        for _ in 0..pad {
+                            out.push(' ');
+                        }
+                        out.push_str(value);
+                    }
+                }
+            }
+            _ => out.push_str(value),
+        }
+    }
+
     match field {
         LogField::Timestamp => {
-            let now = OffsetDateTime::now_utc();
-            // Use fixed 6-digit microsecond precision for consistent timestamp length
-            now.format(
-                &time::format_description::parse(
+            let fmt = TIMESTAMP_FMT.get_or_init(|| {
+                time::format_description::parse_owned::<1>(
                     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z",
                 )
-                .unwrap(),
-            )
-            .unwrap_or_else(|_| "unknown-time".to_string())
+                .expect("timestamp format string is valid")
+            });
+            let now = OffsetDateTime::now_utc();
+            match now.format(fmt) {
+                Ok(ts) => write_padded(out, &ts, spec),
+                Err(_) => write_padded(out, "unknown-time", spec),
+            }
         }
-        LogField::ThreadName => std::thread::current()
-            .name()
-            .unwrap_or("unnamed")
-            .to_string(),
-        LogField::Level => record.level().to_string(),
-        LogField::Target => record.target().to_string(),
-        LogField::Args => format!("{}", record.args()),
-        LogField::ModulePath => record.module_path().unwrap_or_default().to_string(),
-        LogField::File => record.file().unwrap_or_default().to_string(),
-        LogField::Line => record
-            .line()
-            .map(|line| line.to_string())
-            .unwrap_or_default(),
-    }
-}
-
-/// Apply a [`FormatSpec`] to a rendered field value, padding with spaces as needed.
-///
-/// Returns `value` unchanged when `spec.width` is `None` or the string is
-/// already at least as wide as the requested minimum field width.
-fn apply_format_spec(value: &str, spec: FormatSpec) -> String {
-    match spec.width {
-        Some(width) if value.len() < width => {
-            let pad = width - value.len();
-            match spec.align {
-                Align::Left => {
-                    let mut result = String::with_capacity(width);
-                    result.push_str(value);
-                    result.extend(std::iter::repeat(' ').take(pad));
-                    result
+        LogField::ThreadName => {
+            let t = std::thread::current();
+            write_padded(out, t.name().unwrap_or("unnamed"), spec);
+        }
+        LogField::Level => {
+            write_padded(out, record.level().as_str(), spec);
+        }
+        LogField::Target => {
+            write_padded(out, record.target(), spec);
+        }
+        LogField::Args => {
+            // `record.args()` is a `fmt::Arguments` — write it directly to
+            // avoid a temporary String when no padding is required.
+            match spec.width {
+                None => {
+                    let _ = write!(out, "{}", record.args());
                 }
-                Align::Right => {
-                    let mut result = String::with_capacity(width);
-                    result.extend(std::iter::repeat(' ').take(pad));
-                    result.push_str(value);
-                    result
+                Some(_) => {
+                    let s = record.args().to_string();
+                    write_padded(out, &s, spec);
                 }
             }
         }
-        _ => value.to_string(),
+        LogField::ModulePath => {
+            write_padded(out, record.module_path().unwrap_or_default(), spec);
+        }
+        LogField::File => {
+            write_padded(out, record.file().unwrap_or_default(), spec);
+        }
+        LogField::Line => match record.line() {
+            Some(n) => {
+                if spec.width.is_none() {
+                    let _ = write!(out, "{n}");
+                } else {
+                    let s = n.to_string();
+                    write_padded(out, &s, spec);
+                }
+            }
+            None => {}
+        },
     }
 }

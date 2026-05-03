@@ -154,7 +154,9 @@ mod native;
 use log::{Log, SetLoggerError};
 use std::sync::atomic::AtomicBool;
 
-pub use crate::config::{MinimalLoggerConfig, config_from_env};
+pub use crate::config::MinimalLoggerConfig;
+#[allow(deprecated)]
+pub use crate::config::config_from_env;
 use crate::{
     logger::{LOGGER, MinimalLogger, install_runtime_hooks_once},
     native::platform,
@@ -232,31 +234,32 @@ pub fn init(config: MinimalLoggerConfig) -> Result<(), SetLoggerError> {
 /// If the logger has not yet been initialised this function behaves like
 /// [`init()`] with the supplied `config`, discarding any initialisation error.
 pub fn reinit(config: MinimalLoggerConfig) {
-    if LOGGER.get().is_none() {
-        let _ = init(config);
-        return;
-    }
-
-    if let Some(logger) = LOGGER.get() {
-        let current = logger.state.load();
-        let reload = config.into_reload(Some(&current.reload));
-        drop(current);
-        logger.apply_reload(reload);
+    match LOGGER.get() {
+        None => {
+            let _ = init(config);
+        }
+        Some(logger) => {
+            let current = logger.state.load();
+            let reload = config.into_reload(Some(&current.reload));
+            drop(current);
+            logger.apply_reload(reload);
+        }
     }
 }
 
-/// Flush the calling thread's buffered writer to the kernel.
+/// Flush the calling thread's buffered writer to the kernel and stop the
+/// background flush worker.
 ///
-/// Call this near process exit to ensure all buffered log records are written.
-/// Other threads' writers are flushed automatically when those threads exit
-/// via `BufWriter::drop()`.
+/// Call this near process exit to ensure all buffered log records are written
+/// and the flush worker thread has exited cleanly. Other threads' writers are
+/// flushed automatically when those threads exit via `BufWriter::drop()`.
 ///
-/// This function does not stop the background flush worker or close the log
-/// file. If the process exits normally the OS will release remaining file
-/// descriptors.
+/// This function does not close the log file descriptor; the OS releases it
+/// when the process exits.
 pub fn shutdown() {
     if let Some(logger) = LOGGER.get() {
         logger.flush();
+        logger.stop_flush_worker();
     }
 }
 

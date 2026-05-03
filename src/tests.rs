@@ -69,7 +69,12 @@ fn timestamp_placeholder_renders() {
         .build();
 
     let output = format.render(&record);
-    assert!(output.contains("T"));
+    // Timestamp must match the ISO-8601 pattern YYYY-MM-DDThh:mm:ss.xxxxxxZ.
+    let ts = output.split_whitespace().next().unwrap_or("");
+    assert!(
+        ts.len() == 27 && ts.ends_with('Z') && ts.contains('T'),
+        "timestamp did not match expected ISO-8601 format: got {ts:?}"
+    );
     assert!(output.contains("INFO"));
     assert!(output.ends_with('\n'));
 }
@@ -139,4 +144,99 @@ fn enabled_respects_target_filter_levels() {
         .build();
 
     assert!(record.metadata().level() > cfg.level_for(record.metadata().target()));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Format spec: right-alignment and zero-width padding
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn right_alignment_pads_on_left() {
+    let format = LogFormat::parse("{line:>4}");
+    let record = Record::builder()
+        .args(format_args!(""))
+        .level(Level::Info)
+        .target("t")
+        .module_path_static(Some("minimal_logger::tests"))
+        .file_static(Some("f"))
+        .line(Some(7))
+        .build();
+    // Line "7" right-aligned in width 4 → "   7"
+    assert!(format.render(&record).starts_with("   7"));
+}
+
+#[test]
+fn format_spec_width_zero_means_no_padding() {
+    // Width 0 (no colon spec) — value emitted as-is.
+    let format = LogFormat::parse("{level}");
+    let record = Record::builder()
+        .args(format_args!(""))
+        .level(Level::Warn)
+        .target("t")
+        .module_path_static(Some("minimal_logger::tests"))
+        .file_static(Some("f"))
+        .line(Some(1))
+        .build();
+    assert_eq!(format.render(&record).trim_end(), "WARN");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// flush_ms = 0: no background thread spawned, FLUSH_FLAG kept set
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn flush_ms_zero_does_not_spawn_background_thread() {
+    use crate::logger::FlushWorker;
+    use std::sync::atomic::Ordering;
+
+    // Count live threads before and after spawning a zero-interval worker.
+    let before = std::thread::available_parallelism().ok();
+    let _ = before; // available_parallelism is not a thread counter; just check handle.
+
+    let worker = FlushWorker::spawn_for_test(0);
+    assert!(
+        !worker.has_handle(),
+        "flush_ms=0 must not spawn a background thread"
+    );
+    // FLUSH_FLAG must be permanently set so write_record flushes on every call.
+    assert!(
+        crate::FLUSH_FLAG.load(Ordering::Relaxed),
+        "FLUSH_FLAG must be set when flush_ms=0"
+    );
+    // Reset for subsequent tests.
+    crate::FLUSH_FLAG.store(false, Ordering::Relaxed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reinit() delta semantics
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn reinit_unset_fields_inherit_current_value() {
+    // Build a ReloadConfig with all fields set.
+    let base = MinimalLoggerConfig::new()
+        .level(LevelFilter::Debug)
+        .filter("app", LevelFilter::Trace)
+        .flush_ms(2000)
+        .buf_capacity(8192)
+        .format("{level} {args}")
+        .into_reload(None);
+
+    // A config with only the level changed — all other fields should inherit.
+    let delta = MinimalLoggerConfig::new()
+        .level(LevelFilter::Warn)
+        .into_reload(Some(&base));
+
+    assert_eq!(
+        delta.default_level,
+        LevelFilter::Warn,
+        "level should update"
+    );
+    assert_eq!(delta.flush_ms, 2000, "flush_ms should inherit");
+    assert_eq!(delta.buf_capacity, 8192, "buf_capacity should inherit");
+    assert_eq!(
+        delta.format_template, "{level} {args}",
+        "format should inherit"
+    );
+    assert_eq!(delta.filters, base.filters, "filters should inherit");
 }

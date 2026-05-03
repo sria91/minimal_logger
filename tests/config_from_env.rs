@@ -1,4 +1,4 @@
-//! Integration tests for [`minimal_logger::config_from_env()`].
+//! Integration tests for [`minimal_logger::MinimalLoggerConfig::from_env()`].
 //!
 //! Each test sets a specific combination of `RUST_LOG*` environment variables,
 //! calls `config_from_env()`, and asserts that the returned
@@ -26,13 +26,17 @@ struct EnvGuard {
 impl EnvGuard {
     fn set(key: &'static str, value: &str) -> Self {
         let previous = env::var(key).ok();
-        // SAFETY: single-threaded test or test with unique keys.
+        // SAFETY: the test module serialises all env-var mutations behind
+        // `ENV_MUTEX`, ensuring only one thread modifies environment variables
+        // at a time.  All tests in this file must hold `ENV_MUTEX` before
+        // calling `EnvGuard::set` or `EnvGuard::remove`.
         unsafe { env::set_var(key, value) };
         Self { key, previous }
     }
 
     fn remove(key: &'static str) -> Self {
         let previous = env::var(key).ok();
+        // SAFETY: see set() above — ENV_MUTEX must be held.
         unsafe { env::remove_var(key) };
         Self { key, previous }
     }
@@ -41,6 +45,7 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.previous {
+            // SAFETY: ENV_MUTEX is still held by the test that created this guard.
             Some(v) => unsafe { env::set_var(self.key, v) },
             None => unsafe { env::remove_var(self.key) },
         }
@@ -56,7 +61,7 @@ fn rust_log_sets_global_level_debug() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG", "debug");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(cfg.get_level(), Some(LevelFilter::Debug));
     assert!(cfg.get_filters().is_empty());
 }
@@ -66,7 +71,7 @@ fn rust_log_sets_global_level_warn() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG", "warn");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(cfg.get_level(), Some(LevelFilter::Warn));
 }
 
@@ -75,7 +80,7 @@ fn rust_log_sets_global_level_error() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG", "error");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(cfg.get_level(), Some(LevelFilter::Error));
 }
 
@@ -84,7 +89,7 @@ fn rust_log_sets_global_level_trace() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG", "trace");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(cfg.get_level(), Some(LevelFilter::Trace));
 }
 
@@ -93,7 +98,7 @@ fn rust_log_sets_global_level_off() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG", "off");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(cfg.get_level(), Some(LevelFilter::Off));
 }
 
@@ -102,7 +107,7 @@ fn rust_log_absent_defaults_to_info() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::remove("RUST_LOG");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     // When RUST_LOG is absent the function falls back to "info".
     assert_eq!(cfg.get_level(), Some(LevelFilter::Info));
 }
@@ -116,7 +121,7 @@ fn rust_log_parses_single_target_filter() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG", "myapp=debug");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     let filters = cfg.get_filters();
     assert_eq!(filters.len(), 1);
     assert_eq!(filters[0].0, "myapp");
@@ -128,7 +133,7 @@ fn rust_log_parses_global_level_and_target_filter() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG", "warn,myapp::db=trace");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(cfg.get_level(), Some(LevelFilter::Warn));
 
     let filters = cfg.get_filters();
@@ -142,7 +147,7 @@ fn rust_log_parses_multiple_target_filters() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG", "info,myapp=warn,myapp::net=debug");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(cfg.get_level(), Some(LevelFilter::Info));
 
     let filters = cfg.get_filters();
@@ -163,7 +168,7 @@ fn rust_log_file_sets_file_path() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG_FILE", "/tmp/myapp.log");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(
         cfg.get_file_path(),
         Some(std::path::Path::new("/tmp/myapp.log"))
@@ -175,7 +180,7 @@ fn rust_log_file_absent_leaves_path_none() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::remove("RUST_LOG_FILE");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert!(cfg.get_file_path().is_none());
 }
 
@@ -188,7 +193,7 @@ fn rust_log_buffer_size_sets_capacity() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG_BUFFER_SIZE", "8192");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(cfg.get_buf_capacity(), Some(8192));
 }
 
@@ -197,7 +202,7 @@ fn rust_log_buffer_size_absent_leaves_capacity_none() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::remove("RUST_LOG_BUFFER_SIZE");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert!(cfg.get_buf_capacity().is_none());
 }
 
@@ -206,7 +211,7 @@ fn rust_log_buffer_size_invalid_leaves_capacity_none() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG_BUFFER_SIZE", "not_a_number");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert!(cfg.get_buf_capacity().is_none());
 }
 
@@ -219,7 +224,7 @@ fn rust_log_flush_ms_sets_interval() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG_FLUSH_MS", "500");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(cfg.get_flush_ms(), Some(500));
 }
 
@@ -228,7 +233,7 @@ fn rust_log_flush_ms_absent_leaves_interval_none() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::remove("RUST_LOG_FLUSH_MS");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert!(cfg.get_flush_ms().is_none());
 }
 
@@ -237,7 +242,7 @@ fn rust_log_flush_ms_invalid_leaves_interval_none() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG_FLUSH_MS", "forever");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert!(cfg.get_flush_ms().is_none());
 }
 
@@ -250,7 +255,7 @@ fn rust_log_format_sets_template() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::set("RUST_LOG_FORMAT", "{level} {args}");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(cfg.get_format(), Some("{level} {args}"));
 }
 
@@ -259,7 +264,7 @@ fn rust_log_format_absent_leaves_template_none() {
     let _lock = ENV_MUTEX.lock().unwrap();
     let _g = EnvGuard::remove("RUST_LOG_FORMAT");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert!(cfg.get_format().is_none());
 }
 
@@ -276,7 +281,7 @@ fn all_env_vars_set_populates_all_fields() {
     let _rust_log_flush = EnvGuard::set("RUST_LOG_FLUSH_MS", "250");
     let _rust_log_fmt = EnvGuard::set("RUST_LOG_FORMAT", "{timestamp} {level} {args}");
 
-    let cfg = minimal_logger::config_from_env();
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
 
     assert_eq!(cfg.get_level(), Some(LevelFilter::Debug));
 

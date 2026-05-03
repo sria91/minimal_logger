@@ -262,11 +262,11 @@ pub(crate) fn write_record(
         // O(1), no lock, no allocation.
         //
         // `slot.is_none()` covers first-use initialisation.
-        let stale = slot
+        let writer_is_stale = slot
             .as_ref()
             .map_or(true, |bw| !Arc::ptr_eq(&bw.get_ref().0, &current));
 
-        if stale {
+        if writer_is_stale {
             // Flush old BufWriter first so no bytes are lost.
             // If the writer is stale (rotation), flush() calls
             // FileWriter::write() which writes to the OLD file — correct,

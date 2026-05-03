@@ -54,9 +54,24 @@ pub(crate) struct FlushWorker {
 impl FlushWorker {
     /// Spawn a flush worker that sets `FLUSH_FLAG` every `flush_ms` milliseconds.
     ///
+    /// When `flush_ms == 0` no thread is spawned; instead `FLUSH_FLAG` is set
+    /// permanently so that every `write_record` call flushes immediately. This
+    /// prevents a tight busy-spin that would otherwise burn a CPU core.
+    ///
     /// If the thread cannot be spawned, prints a warning to stderr and returns a
     /// no-op worker; periodic flushing will be disabled for that interval.
     fn spawn(flush_ms: u64) -> Self {
+        if flush_ms == 0 {
+            // Per-record flush: keep FLUSH_FLAG permanently set.
+            // write_record() swaps it to false on each call then flushes — net
+            // effect is a flush after every record with no background thread.
+            FLUSH_FLAG.store(true, Ordering::Relaxed);
+            return FlushWorker {
+                stop: Arc::new(AtomicBool::new(false)),
+                handle: None,
+            };
+        }
+
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
 
@@ -97,6 +112,19 @@ impl FlushWorker {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+
+    /// Test helper: call `spawn` with a given `flush_ms` without going through
+    /// the full logger initialisation. Allows unit tests to inspect `has_handle`.
+    #[cfg(test)]
+    pub(crate) fn spawn_for_test(flush_ms: u64) -> Self {
+        Self::spawn(flush_ms)
+    }
+
+    /// Returns `true` if this worker has a live background thread handle.
+    #[cfg(test)]
+    pub(crate) fn has_handle(&self) -> bool {
+        self.handle.is_some()
     }
 }
 
@@ -175,6 +203,36 @@ impl MinimalLogger {
         }
     }
 
+    /// Signal the flush worker to exit and wait for it to finish.
+    ///
+    /// Called by [`shutdown()`] so that no further `FLUSH_FLAG` stores can
+    /// race with the process tearing down.
+    pub(crate) fn stop_flush_worker(&self) {
+        if let Ok(mut worker) = self.flush_worker.lock() {
+            worker.stop();
+        }
+    }
+
+    /// Release the old `Arc<LogFile>` after a file swap, logging the outcome.
+    ///
+    /// Extracted to a single place so that `swap_file_handle` and `reopen`
+    /// both produce identical diagnostic messages.
+    fn release_old_log_file(old_arc: Arc<LogFile>) {
+        match Arc::try_unwrap(old_arc) {
+            Ok(old_log_file) => {
+                old_log_file.flush_and_sync();
+                drop(old_log_file);
+                eprintln!("[minimal_logger] Old log file flushed, synced, and closed");
+            }
+            Err(still_shared) => {
+                drop(still_shared);
+                eprintln!(
+                    "[minimal_logger] Old log file has live BufWriters — will close when threads rotate"
+                );
+            }
+        }
+    }
+
     /// Atomically replace the active `LogFile`, flushing and syncing the old one.
     ///
     /// If this is the last `Arc` for the old file it is immediately flushed,
@@ -182,21 +240,8 @@ impl MinimalLogger {
     /// holding a reference rotate to the new one on their next log call.
     fn swap_file_handle(&self, replacement: Option<Arc<LogFile>>) {
         let old = self.file.swap(replacement);
-
         if let Some(old_arc) = old {
-            match Arc::try_unwrap(old_arc) {
-                Ok(old_log_file) => {
-                    old_log_file.flush_and_sync();
-                    drop(old_log_file);
-                    eprintln!("[minimal_logger] Old log file flushed, synced, and closed");
-                }
-                Err(still_shared) => {
-                    drop(still_shared);
-                    eprintln!(
-                        "[minimal_logger] Old log file has live BufWriters — will close when threads rotate"
-                    );
-                }
-            }
+            Self::release_old_log_file(old_arc);
         }
     }
 
@@ -281,37 +326,7 @@ impl MinimalLogger {
         let old = self.file.swap(Some(new_log_file));
 
         if let Some(old_arc) = old {
-            match Arc::try_unwrap(old_arc) {
-                Ok(old_log_file) => {
-                    // Sole owner — no other thread holds an Arc to the old LogFile.
-                    // All active BufWriters have either already flushed (if they
-                    // detected the rotation via ptr_eq) or belong to threads that
-                    // have not logged since the swap.
-                    //
-                    // flush_and_sync() on the old LogFile:
-                    //   1. Flushes calling thread's BufWriter to the old file
-                    //      (if the calling thread's writer still points to it).
-                    //   2. sync_file():
-                    //        Linux  : fdatasync()
-                    //        macOS  : F_FULLFSYNC
-                    //        Windows: FlushFileBuffers()
-                    old_log_file.flush_and_sync();
-                    drop(old_log_file); // fd closed explicitly
-                    eprintln!("[minimal_logger] Old log file flushed, synced, and closed");
-                }
-                Err(still_shared) => {
-                    // Other threads still hold an Arc inside their BufWriter's
-                    // FileWriter.  They will detect the rotation on their next
-                    // log call (Arc::ptr_eq mismatch), flush their BufWriter to
-                    // the old file, then create a new BufWriter for the new file.
-                    // When the last such thread releases its Arc, LogFile::drop()
-                    // runs and the fd closes.
-                    drop(still_shared);
-                    eprintln!(
-                        "[minimal_logger] Old log file has live BufWriters — will close when threads rotate"
-                    );
-                }
-            }
+            Self::release_old_log_file(old_arc);
         }
 
         eprintln!("[minimal_logger] Reopened: {path}");
