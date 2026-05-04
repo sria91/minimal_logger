@@ -215,6 +215,15 @@ fn rust_log_buffer_size_invalid_leaves_capacity_none() {
     assert!(cfg.get_buf_capacity().is_none());
 }
 
+#[test]
+fn rust_log_buffer_size_huge_value_is_clamped() {
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _g = EnvGuard::set("RUST_LOG_BUFFER_SIZE", "999999999999");
+
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
+    assert_eq!(cfg.get_buf_capacity(), Some(1024 * 1024));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RUST_LOG_FLUSH_MS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -246,6 +255,15 @@ fn rust_log_flush_ms_invalid_leaves_interval_none() {
     assert!(cfg.get_flush_ms().is_none());
 }
 
+#[test]
+fn rust_log_flush_ms_huge_value_is_clamped() {
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _g = EnvGuard::set("RUST_LOG_FLUSH_MS", "999999999999");
+
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
+    assert_eq!(cfg.get_flush_ms(), Some(60 * 60 * 1000));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RUST_LOG_FORMAT
 // ─────────────────────────────────────────────────────────────────────────────
@@ -266,6 +284,19 @@ fn rust_log_format_absent_leaves_template_none() {
 
     let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert!(cfg.get_format().is_none());
+}
+
+#[test]
+fn rust_log_format_huge_template_uses_default() {
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let template = "x".repeat(8 * 1024 + 1);
+    let _g = EnvGuard::set("RUST_LOG_FORMAT", &template);
+
+    let cfg = minimal_logger::MinimalLoggerConfig::from_env();
+    assert_eq!(
+        cfg.get_format(),
+        Some("{timestamp} [{level:<5}] T[{thread_name}] [{file}:{line}] {args}")
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

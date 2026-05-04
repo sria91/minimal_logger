@@ -9,7 +9,7 @@ reconfiguration via a builder API.
 - Thread-local buffered logging with `BufWriter`
 - Platform-specific log rotation
   - Linux / macOS: `SIGHUP`
-  - Windows: `Global\\RustLogger_LogRotate` named event
+  - Windows: `Local\\RustLogger_LogRotate` named event
 - Periodic background flush thread with configurable interval
 - Builder-based configuration for log level, output file, buffer size, and format
 - Environment-variable bootstrap via `config_from_env()`
@@ -22,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-minimal_logger = "0.2"
+minimal_logger = "0.4"
 log = "0.4"
 ```
 
@@ -95,8 +95,13 @@ fn reconfigure() {
 | `.file(path)`      | *(stderr)*        | Append log records to a file (`O_APPEND`)            |
 | `.stderr()`        | *(default)*       | Explicitly route output back to stderr               |
 | `.buf_capacity(n)` | `4096`            | Per-thread `BufWriter` capacity in bytes             |
-| `.flush_ms(ms)`    | `1000`            | Periodic flush interval in milliseconds              |
+| `.flush_ms(ms)`    | `1000`            | Periodic flush interval; `0` flushes every record     |
 | `.format(tmpl)`    | *see below*       | Log-line template with `{field}` placeholders        |
+
+New Unix log files are created with owner-only permissions, subject to the
+process umask. Oversized buffer sizes, flush intervals, format templates,
+format widths, and filter lists are bounded to avoid accidental memory or
+latency spikes from environment variables.
 
 ### Level and filter syntax
 
@@ -150,7 +155,7 @@ gap in output and no lost bytes.
 |---------------|-------------------------------------------|
 | Linux / macOS | `SIGHUP`                                  |
 | Other Unix    | `SIGHUP`                                  |
-| Windows       | `Global\RustLogger_LogRotate` named event |
+| Windows       | `Local\RustLogger_LogRotate` named event |
 
 When the signal fires, each thread detects the new file on its **next log call**
 via an `Arc` pointer comparison: it flushes its buffered bytes to the old file
@@ -173,7 +178,7 @@ Example logrotate configuration (Linux):
 
 | Function                        | Description                                                        |
 |---------------------------------|--------------------------------------------------------------------|
-| `init(MinimalLoggerConfig)`     | Register the logger and start the flush worker. Call once at startup. |
+| `init(MinimalLoggerConfig)`     | Register the logger and start the flush worker when needed. Call once at startup. |
 | `reinit(MinimalLoggerConfig)`   | Apply a new config; update only changed subsystems.               |
 | `config_from_env()`             | Build a `MinimalLoggerConfig` from `RUST_LOG*` environment variables. |
 | `shutdown()`                    | Flush the calling thread's buffered writer before process exit.    |

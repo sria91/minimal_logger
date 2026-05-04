@@ -1,13 +1,28 @@
-use crate::config::{ActiveConfig, DEFAULT_LOG_FORMAT, LogFormat};
+use crate::config::{
+    ActiveConfig, DEFAULT_LOG_FORMAT, LogFormat, MAX_BUF_CAPACITY, MAX_FLUSH_MS,
+    MAX_FORMAT_FIELD_WIDTH, MAX_FORMAT_TEMPLATE_LEN,
+};
 
 use super::*;
 use log::{Level, LevelFilter, Record};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_TEMP_LOG: AtomicUsize = AtomicUsize::new(0);
+
+fn temp_log_path(name: &str) -> std::path::PathBuf {
+    let id = NEXT_TEMP_LOG.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "minimal_logger_{name}_{}_{}.log",
+        std::process::id(),
+        id
+    ))
+}
 
 #[test]
 fn default_log_format_renders() {
     let format = LogFormat::parse(DEFAULT_LOG_FORMAT);
     let record = Record::builder()
-        .args(format_args!("{}", "hello"))
+        .args(format_args!("hello"))
         .level(Level::Info)
         .target("test")
         .module_path_static(Some("minimal_logger::tests"))
@@ -28,7 +43,7 @@ fn default_log_format_renders() {
 fn custom_log_format_renders_placeholders() {
     let format = LogFormat::parse("{level}|{target}|{args}|{module_path}|{file}|{line}");
     let record = Record::builder()
-        .args(format_args!("{}", "ok"))
+        .args(format_args!("ok"))
         .level(Level::Debug)
         .target("myapp")
         .module_path_static(Some("minimal_logger::tests"))
@@ -46,7 +61,7 @@ fn custom_log_format_renders_placeholders() {
 fn escaped_braces_render_literal_braces() {
     let format = LogFormat::parse("{{level}} {level}");
     let record = Record::builder()
-        .args(format_args!("{}", "y"))
+        .args(format_args!("y"))
         .level(Level::Warn)
         .target("x")
         .module_path_static(Some("minimal_logger::tests"))
@@ -60,7 +75,7 @@ fn escaped_braces_render_literal_braces() {
 fn timestamp_placeholder_renders() {
     let format = LogFormat::parse("{timestamp} {level} {args}");
     let record = Record::builder()
-        .args(format_args!("{}", "test"))
+        .args(format_args!("test"))
         .level(Level::Info)
         .target("test")
         .module_path_static(Some("minimal_logger::tests"))
@@ -83,7 +98,7 @@ fn timestamp_placeholder_renders() {
 fn thread_name_placeholder_renders() {
     let format = LogFormat::parse("{thread_name} {level} {args}");
     let record = Record::builder()
-        .args(format_args!("{}", "test"))
+        .args(format_args!("test"))
         .level(Level::Info)
         .target("test")
         .module_path_static(Some("minimal_logger::tests"))
@@ -181,30 +196,130 @@ fn format_spec_width_zero_means_no_padding() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// flush_ms = 0: no background thread spawned, FLUSH_FLAG kept set
+// flush_ms = 0: no background thread spawned, records flush synchronously
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn flush_ms_zero_does_not_spawn_background_thread() {
     use crate::logger::FlushWorker;
-    use std::sync::atomic::Ordering;
-
-    // Count live threads before and after spawning a zero-interval worker.
-    let before = std::thread::available_parallelism().ok();
-    let _ = before; // available_parallelism is not a thread counter; just check handle.
 
     let worker = FlushWorker::spawn_for_test(0);
     assert!(
         !worker.has_handle(),
         "flush_ms=0 must not spawn a background thread"
     );
-    // FLUSH_FLAG must be permanently set so write_record flushes on every call.
     assert!(
-        crate::FLUSH_FLAG.load(Ordering::Relaxed),
-        "FLUSH_FLAG must be set when flush_ms=0"
+        !crate::FLUSH_FLAG.load(Ordering::Relaxed),
+        "flush_ms=0 should not depend on the periodic flush flag"
     );
-    // Reset for subsequent tests.
-    crate::FLUSH_FLAG.store(false, Ordering::Relaxed);
+}
+
+#[test]
+fn flush_ms_zero_flushes_each_record_after_write() {
+    crate::log_file::flush_and_clear_thread_writer();
+    let path = temp_log_path("flush_each_record");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("open temp log file");
+
+    let log_file = std::sync::Arc::new(crate::log_file::LogFile::new(file, 64));
+    let format = LogFormat::parse("{args}");
+    let record = Record::builder()
+        .args(format_args!("flushed"))
+        .level(Level::Info)
+        .target("t")
+        .module_path_static(Some("minimal_logger::tests"))
+        .file_static(Some("f"))
+        .line(Some(1))
+        .build();
+
+    crate::log_file::write_record(&record, std::sync::Arc::clone(&log_file), 64, true, &format);
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "flushed\n");
+    crate::log_file::flush_and_clear_thread_writer();
+    drop(log_file);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn reconfiguring_to_stderr_flushes_current_thread_file_buffer() {
+    crate::log_file::flush_and_clear_thread_writer();
+    let path = temp_log_path("stderr_reinit");
+
+    let logger = crate::logger::MinimalLogger::from_config(
+        MinimalLoggerConfig::new()
+            .file(&path)
+            .format("{args}")
+            .buf_capacity(1024)
+            .flush_ms(MAX_FLUSH_MS),
+    );
+
+    let record = Record::builder()
+        .args(format_args!("before-stderr"))
+        .level(Level::Info)
+        .target("t")
+        .module_path_static(Some("minimal_logger::tests"))
+        .file_static(Some("f"))
+        .line(Some(1))
+        .build();
+
+    logger.log(&record);
+
+    let current = logger.state.load();
+    let reload = MinimalLoggerConfig::new()
+        .stderr()
+        .into_reload(Some(&current.reload));
+    drop(current);
+    logger.apply_reload(reload);
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "before-stderr\n");
+    drop(logger);
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[test]
+fn created_log_files_do_not_grant_group_or_world_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp_log_path("permissions");
+    let logger = crate::logger::MinimalLogger::from_config(MinimalLoggerConfig::new().file(&path));
+    drop(logger);
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode & 0o077, 0, "group/other permission bits must be clear");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn oversized_config_values_are_bounded() {
+    let cfg = MinimalLoggerConfig::new()
+        .buf_capacity(MAX_BUF_CAPACITY + 1)
+        .flush_ms(MAX_FLUSH_MS + 1)
+        .format("x".repeat(MAX_FORMAT_TEMPLATE_LEN + 1));
+
+    assert_eq!(cfg.get_buf_capacity(), Some(MAX_BUF_CAPACITY));
+    assert_eq!(cfg.get_flush_ms(), Some(MAX_FLUSH_MS));
+    assert_eq!(cfg.get_format(), Some(DEFAULT_LOG_FORMAT));
+
+    let format = LogFormat::parse(&format!("{{level:<{}}}", MAX_FORMAT_FIELD_WIDTH + 1));
+    let record = Record::builder()
+        .args(format_args!(""))
+        .level(Level::Info)
+        .target("t")
+        .module_path_static(Some("minimal_logger::tests"))
+        .file_static(Some("f"))
+        .line(Some(1))
+        .build();
+
+    let rendered = format.render(&record);
+    assert!(rendered.starts_with("INFO"));
+    assert_eq!(
+        rendered.trim_end_matches('\n').len(),
+        MAX_FORMAT_FIELD_WIDTH
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

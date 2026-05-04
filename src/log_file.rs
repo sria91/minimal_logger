@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 
 use log::Record;
 
-use crate::{FLUSH_FLAG, config::LogFormat, platform};
+use crate::{FLUSH_FLAG, config::LogFormat, platform, report_io_error};
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  UNIX: LogFile — bare File, no Mutex
@@ -39,7 +39,9 @@ impl LogFile {
     /// this thread is the last holder of the old `LogFile`.
     pub(crate) fn flush_and_sync(&self) {
         with_thread_writer(|bw| {
-            let _ = bw.flush();
+            if let Err(err) = bw.flush() {
+                report_io_error("flush buffered log records", &err);
+            }
         });
         platform::sync_file(&self.file);
     }
@@ -82,7 +84,9 @@ impl LogFile {
     /// Called by [`MinimalLogger::reopen`] after `Arc::try_unwrap` succeeds.
     pub(crate) fn flush_and_sync(&self) {
         with_thread_writer(|bw| {
-            let _ = bw.flush();
+            if let Err(err) = bw.flush() {
+                report_io_error("flush buffered log records", &err);
+            }
         });
         if let Ok(f) = self.file.lock() {
             platform::sync_file(&*f);
@@ -172,7 +176,7 @@ impl Write for FileWriter {
 //  ─────────
 //  First log call   : `None` → `Some(BufWriter::with_capacity(…))`
 //                     One heap allocation: BufWriter's internal byte buffer.
-//  Normal log call  : writeln! into BufWriter's internal buffer — zero alloc.
+//  Normal log call  : render the line, then write it into BufWriter's buffer.
 //                     BufWriter flushes automatically when buffer is full.
 //  Periodic flush   : FLUSH_FLAG seen → bw.flush() — no alloc.
 //  Rotation         : Arc::ptr_eq mismatch → bw.flush() (old file) → replace.
@@ -193,7 +197,7 @@ impl Write for FileWriter {
 
 thread_local! {
     static THREAD_WRITER: std::cell::RefCell<Option<BufWriter<FileWriter>>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Invoke `f` with the calling thread's `BufWriter`, if one has been initialised.
@@ -210,6 +214,20 @@ where
     });
 }
 
+/// Flush and drop the calling thread's cached file writer, if it has one.
+///
+/// Used when output is reconfigured to stderr so the thread does not keep
+/// buffering records for a file that is no longer the active destination.
+pub(crate) fn flush_and_clear_thread_writer() {
+    THREAD_WRITER.with(|cell| {
+        if let Some(mut bw) = cell.borrow_mut().take()
+            && let Err(err) = bw.flush()
+        {
+            report_io_error("flush buffered log records", &err);
+        }
+    });
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  COMMON: write_record
 //
@@ -217,8 +235,8 @@ where
 //
 //    Arc::ptr_eq()             1 pointer compare — branch not taken
 //    FLUSH_FLAG.swap()         1 atomic op       — false, branch not taken
-//    writeln!(bw, …)           extend_from_slice into BufWriter's Vec<u8>
-//                              zero allocation while buffer has capacity
+//    format.render(record)     one output String for the rendered log line
+//    write_all(bytes)          extend_from_slice into BufWriter's Vec<u8>
 //    BufWriter internal check  if len >= capacity → FileWriter::write()
 //                              one write() syscall per buffer-full event
 //
@@ -226,7 +244,7 @@ where
 //    bw.flush()                FileWriter::write(remaining bytes) to OLD file
 //    drop old BufWriter        BufWriter::drop() — another flush (no-op, already empty)
 //    BufWriter::with_capacity  one heap allocation: new internal byte buffer
-//    writeln!(bw, …)           first write into new buffer
+//    write_all(bytes)          first write into new buffer
 //
 //  `current: Arc<LogFile>` is cloned from ArcSwapOption::load_full() in Log::log().
 //  load_full() increments the Arc refcount (atomic inc, ~1 ns, no heap alloc).
@@ -243,10 +261,13 @@ where
 /// 2. **Periodic flush** — if `FLUSH_FLAG` is set by the background worker, the
 ///    buffer is flushed before appending the new record.
 /// 3. **Write** — the rendered record bytes are appended to the buffer.
+/// 4. **Per-record flush** — when `flush_ms == 0`, the new record is flushed
+///    synchronously after it is written.
 pub(crate) fn write_record(
     record: &Record,
     current: Arc<LogFile>,
     capacity: usize,
+    flush_every_record: bool,
     format: &LogFormat,
 ) {
     THREAD_WRITER.with(|cell| {
@@ -264,7 +285,7 @@ pub(crate) fn write_record(
         // `slot.is_none()` covers first-use initialisation.
         let writer_is_stale = slot
             .as_ref()
-            .map_or(true, |bw| !Arc::ptr_eq(&bw.get_ref().0, &current));
+            .is_none_or(|bw| !Arc::ptr_eq(&bw.get_ref().0, &current));
 
         if writer_is_stale {
             // Flush old BufWriter first so no bytes are lost.
@@ -274,8 +295,10 @@ pub(crate) fn write_record(
             // BufWriter is then dropped here (replaced by `*slot = Some(…)`),
             // which calls drop() → another flush(), but the buffer is already
             // empty so it is a no-op.
-            if let Some(old_bw) = slot.as_mut() {
-                let _ = old_bw.flush();
+            if let Some(old_bw) = slot.as_mut()
+                && let Err(err) = old_bw.flush()
+            {
+                report_io_error("flush stale buffered log records", &err);
             }
 
             // Create a fresh BufWriter pointing to the current LogFile.
@@ -288,26 +311,34 @@ pub(crate) fn write_record(
 
         // ── Periodic flush ────────────────────────────────────────────────
         // FLUSH_FLAG was set by the background flush thread.
-        // Acquire ordering pairs with the Relaxed store in the flush thread.
+        // Acquire ordering observes the worker's Release store.
         // swap(false) atomically reads and clears — one thread handles the flush,
         // others see false and skip it.
         //
         // We flush BEFORE writing the new record so the file sees a clean
         // time boundary: all previously buffered lines are written first,
         // then the new record follows immediately after.
-        if FLUSH_FLAG.swap(false, Ordering::Acquire) {
-            if let Some(bw) = slot.as_mut() {
-                let _ = bw.flush();
-                // bw.flush() calls FileWriter::write(buffered_bytes):
-                //   Unix   : write() syscall via O_APPEND fd — atomic, no lock.
-                //   Windows: Mutex<File>::lock() → WriteFile() → unlock.
-                // FileWriter::flush() is then called but is a no-op.
+        if FLUSH_FLAG.swap(false, Ordering::Acquire)
+            && let Some(bw) = slot.as_mut()
+        {
+            let flush_result = bw.flush();
+            // bw.flush() calls FileWriter::write(buffered_bytes):
+            //   Unix   : write() syscall via O_APPEND fd — atomic, no lock.
+            //   Windows: Mutex<File>::lock() → WriteFile() → unlock.
+            // FileWriter::flush() is then called but is a no-op.
+            if let Err(err) = flush_result {
+                report_io_error("flush buffered log records", &err);
             }
         }
 
         // ── Write the record into BufWriter's internal buffer ─────────────
         if let Some(bw) = slot.as_mut() {
-            let _ = bw.write_all(format.render(record).as_bytes());
+            if let Err(err) = bw.write_all(format.render(record).as_bytes()) {
+                report_io_error("write log record", &err);
+            }
+            if flush_every_record && let Err(err) = bw.flush() {
+                report_io_error("flush log record", &err);
+            }
         }
 
         // `current` Arc drops here — atomic refcount decrement, no heap free

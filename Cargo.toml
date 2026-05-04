@@ -2,6 +2,7 @@
 name = "minimal_logger"
 authors = [
     "Srikanth Anantharam <sria91@gmail.com>",
+    "OpenAI Codex <codex@openai.com>",
     "GitHub Copilot <copilot@github.com>",
     "Anthropic Claude <claude@anthropic.com>",
 ]
@@ -12,7 +13,7 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sria91/minimal_logger"
 documentation = "https://docs.rs/minimal_logger"
-keywords = ["log", "logging", "embedded", "no-alloc", "minimal"]
+keywords = ["log", "logging", "embedded", "low-overhead", "minimal"]
 categories = ["development-tools::debugging", "embedded"]
 
 [dependencies]

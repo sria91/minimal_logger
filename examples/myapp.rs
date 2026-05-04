@@ -1,7 +1,5 @@
 use std::{thread::sleep, time::Duration};
 
-use minimal_logger;
-
 use log::{debug, error, info, trace, warn};
 
 mod db {

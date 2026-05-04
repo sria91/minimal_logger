@@ -1,6 +1,6 @@
 //! Minimal-resource logger for Rust applications.
 //!
-//! `minimal_logger` provides a zero-allocation-on-hot-path, thread-buffered logger
+//! `minimal_logger` provides a low-allocation, thread-buffered logger
 //! with optional file output, periodic flushing, platform-native log rotation, and
 //! change-aware runtime reconfiguration via a builder API.
 //!
@@ -33,8 +33,12 @@
 //! | `.file(path)`      | *(stderr)*        | Append log records to a file (`O_APPEND`)           |
 //! | `.stderr()`        | *(default)*       | Explicitly route output back to stderr              |
 //! | `.buf_capacity(n)` | `4096`            | Per-thread `BufWriter` capacity in bytes            |
-//! | `.flush_ms(ms)`    | `1000`            | Periodic flush interval in milliseconds             |
+//! | `.flush_ms(ms)`    | `1000`            | Periodic flush interval; `0` flushes every record   |
 //! | `.format(tmpl)`    | *see below*       | Log-line template with `{field}` placeholders       |
+//!
+//! New Unix log files are created with owner-only permissions, subject to the
+//! process umask. Oversized environment/config values are bounded to avoid
+//! accidental memory or latency spikes.
 //!
 //! ## Reading from environment variables
 //!
@@ -96,9 +100,10 @@
 //!
 //! # Lifecycle
 //!
-//! 1. [`init()`] registers the global logger and starts the flush worker thread.
-//! 2. Log macros (`info!`, `debug!`, …) write into the calling thread's `BufWriter`
-//!    with no heap allocation on the steady-state path.
+//! 1. [`init()`] registers the global logger and starts the flush worker thread
+//!    when the configured flush interval is non-zero.
+//! 2. Log macros (`info!`, `debug!`, …) render one log line and write it into
+//!    the calling thread's `BufWriter`.
 //! 3. [`reinit()`] applies a new [`MinimalLoggerConfig`] and updates only the subsystems
 //!    whose effective configuration changed.
 //! 4. [`shutdown()`] flushes the calling thread's buffered writer to the kernel.
@@ -119,7 +124,8 @@
 //! Only the components whose resolved value actually changed are updated:
 //!
 //! - **Filters / max level** — recomputed and applied via `log::set_max_level`.
-//! - **Output file** — old file flushed, synced, and closed; new file opened.
+//! - **Output file** — new file opened; old thread-local writers flush before
+//!   switching destinations and the old descriptor closes after the last writer drops.
 //! - **Flush interval** — old worker thread stopped and joined; new one spawned.
 //! - **Format template** — new parsed template swapped in atomically.
 //! - **Buffer size** — applied the next time a thread-local writer is recreated.
@@ -139,7 +145,7 @@
 //! |----------------|-------------------------------------------|
 //! | Linux / macOS  | `SIGHUP`                                  |
 //! | Other Unix     | `SIGHUP`                                  |
-//! | Windows        | `Global\RustLogger_LogRotate` named event |
+//! | Windows        | `Local\RustLogger_LogRotate` named event |
 //!
 //! When rotation fires, each thread detects the new file on its next log call via
 //! an `Arc` pointer comparison: it flushes buffered bytes to the old file descriptor,
@@ -152,7 +158,7 @@ mod logger;
 mod native;
 
 use log::{Log, SetLoggerError};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use crate::config::MinimalLoggerConfig;
 #[allow(deprecated)]
@@ -179,6 +185,14 @@ static REOPEN_FLAG: AtomicBool = AtomicBool::new(false);
 /// Set by the background flush worker to request a `bw.flush()` call inside
 /// `write_record` before the next record is written.
 static FLUSH_FLAG: AtomicBool = AtomicBool::new(false);
+/// Ensures repeated I/O failures do not recursively flood stderr.
+static IO_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn report_io_error(context: &str, err: &std::io::Error) {
+    if !IO_ERROR_REPORTED.swap(true, Ordering::Relaxed) {
+        eprintln!("[minimal_logger] {context} failed: {err}");
+    }
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  COMMON: Public API
@@ -202,13 +216,29 @@ static FLUSH_FLAG: AtomicBool = AtomicBool::new(false);
 /// - A platform rotation handler (`SIGHUP` on Unix; a named event on Windows).
 /// - A panic hook that flushes the calling thread's buffer before the process unwinds.
 pub fn init(config: MinimalLoggerConfig) -> Result<(), SetLoggerError> {
-    let logger = LOGGER.get_or_init(|| MinimalLogger::from_config(config));
+    if let Some(logger) = LOGGER.get().copied() {
+        return log::set_logger(logger);
+    }
+
+    let raw = Box::into_raw(Box::new(MinimalLogger::from_config(config)));
+    // SAFETY: `raw` came from `Box::into_raw` and remains valid until either
+    // `log::set_logger` succeeds and the logger intentionally lives for the
+    // process lifetime, or the error path reconstructs and drops the box.
+    let logger = unsafe { &*raw };
+
+    if let Err(err) = log::set_logger(logger) {
+        // SAFETY: `set_logger` failed, so the global log facade did not retain
+        // this reference. Rebuild the Box to stop the worker and close the file.
+        unsafe { drop(Box::from_raw(raw)) };
+        return Err(err);
+    }
+
+    let already_set = LOGGER.set(logger).is_err();
+    debug_assert!(!already_set);
 
     install_runtime_hooks_once();
 
     let max = logger.state.load().max_level;
-
-    log::set_logger(logger)?;
     log::set_max_level(max);
 
     Ok(())
@@ -226,7 +256,7 @@ pub fn init(config: MinimalLoggerConfig) -> Result<(), SetLoggerError> {
 /// | Changed setting          | Effect                                                  |
 /// |--------------------------|---------------------------------------------------------|
 /// | `.level()` / `.filter()` | Log filters and max level updated atomically            |
-/// | `.file()` / `.stderr()`  | Old file flushed, synced, and closed; new file opened   |
+/// | `.file()` / `.stderr()`  | Destination swapped; old thread-local writers flush on switch |
 /// | `.flush_ms()`            | Old flush worker stopped and joined; new worker spawned |
 /// | `.format()`              | Format template swapped atomically                      |
 /// | `.buf_capacity()`        | Applied when a thread-local writer is next recreated    |
@@ -234,7 +264,7 @@ pub fn init(config: MinimalLoggerConfig) -> Result<(), SetLoggerError> {
 /// If the logger has not yet been initialised this function behaves like
 /// [`init()`] with the supplied `config`, discarding any initialisation error.
 pub fn reinit(config: MinimalLoggerConfig) {
-    match LOGGER.get() {
+    match LOGGER.get().copied() {
         None => {
             let _ = init(config);
         }
@@ -257,7 +287,7 @@ pub fn reinit(config: MinimalLoggerConfig) {
 /// This function does not close the log file descriptor; the OS releases it
 /// when the process exits.
 pub fn shutdown() {
-    if let Some(logger) = LOGGER.get() {
+    if let Some(logger) = LOGGER.get().copied() {
         logger.flush();
         logger.stop_flush_worker();
     }

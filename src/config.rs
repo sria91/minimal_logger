@@ -9,11 +9,23 @@ use crate::logger::FileTarget;
 
 /// Default capacity of each thread-local [`BufWriter`], in bytes.
 pub(crate) const DEFAULT_BUF_CAPACITY: usize = 4 * 1024;
+/// Maximum accepted capacity of each thread-local [`BufWriter`], in bytes.
+pub(crate) const MAX_BUF_CAPACITY: usize = 1024 * 1024;
 /// Default interval at which the flush worker wakes and sets `FLUSH_FLAG`, in milliseconds.
 pub(crate) const DEFAULT_FLUSH_MS: u64 = 1_000;
+/// Maximum periodic flush interval accepted from builder/env configuration.
+pub(crate) const MAX_FLUSH_MS: u64 = 60 * 60 * 1_000;
 /// Default log-line template used when `RUST_LOG_FORMAT` is not set.
 pub(crate) const DEFAULT_LOG_FORMAT: &str =
     "{timestamp} [{level:<5}] T[{thread_name}] [{file}:{line}] {args}";
+/// Maximum accepted log-line format template length, in bytes.
+pub(crate) const MAX_FORMAT_TEMPLATE_LEN: usize = 8 * 1024;
+/// Maximum accepted width for a single formatted field.
+pub(crate) const MAX_FORMAT_FIELD_WIDTH: usize = 4 * 1024;
+/// Maximum number of accepted `target=level` filters.
+pub(crate) const MAX_FILTERS: usize = 128;
+/// Maximum accepted length of a filter target, in bytes.
+pub(crate) const MAX_FILTER_TARGET_LEN: usize = 256;
 
 /// A snapshot of resolved logger configuration.
 ///
@@ -95,6 +107,9 @@ impl ActiveConfig {
 /// On [`init()`], any unset field falls back to its compile-time default:
 /// `Info` level, stderr output, 4 KiB buffer, 1 s flush interval, and the
 /// built-in timestamp/level/thread/file/line format.
+/// Oversized buffer sizes, flush intervals, format templates, format widths,
+/// and filter lists are bounded to avoid accidental memory or latency spikes
+/// from environment-derived configuration.
 ///
 /// On [`reinit()`], any unset field **keeps its current value** — so you can
 /// update a single subsystem without touching the others:
@@ -130,6 +145,47 @@ impl Default for MinimalLoggerConfig {
     }
 }
 
+fn bounded_buf_capacity(bytes: usize) -> usize {
+    if bytes > MAX_BUF_CAPACITY {
+        eprintln!("[minimal_logger] Buffer size {bytes} exceeds max {MAX_BUF_CAPACITY} — clamping");
+        MAX_BUF_CAPACITY
+    } else {
+        bytes
+    }
+}
+
+fn bounded_flush_ms(ms: u64) -> u64 {
+    if ms > MAX_FLUSH_MS {
+        eprintln!("[minimal_logger] Flush interval {ms}ms exceeds max {MAX_FLUSH_MS}ms — clamping");
+        MAX_FLUSH_MS
+    } else {
+        ms
+    }
+}
+
+fn bounded_format_template(template: String) -> String {
+    if template.len() > MAX_FORMAT_TEMPLATE_LEN {
+        eprintln!(
+            "[minimal_logger] Format template is {} bytes; max is {MAX_FORMAT_TEMPLATE_LEN} — using default",
+            template.len()
+        );
+        DEFAULT_LOG_FORMAT.to_string()
+    } else {
+        template
+    }
+}
+
+fn bounded_format_width(width: usize) -> usize {
+    if width > MAX_FORMAT_FIELD_WIDTH {
+        eprintln!(
+            "[minimal_logger] Format field width {width} exceeds max {MAX_FORMAT_FIELD_WIDTH} — clamping"
+        );
+        MAX_FORMAT_FIELD_WIDTH
+    } else {
+        width
+    }
+}
+
 impl MinimalLoggerConfig {
     /// Create a new `MinimalLoggerConfig` with all fields unset.
     ///
@@ -159,7 +215,7 @@ impl MinimalLoggerConfig {
     ///
     /// `target` is matched as a prefix of the log record's target string
     /// (typically the module path). The most specific (longest) matching
-    /// prefix wins. May be called multiple times.
+    /// prefix wins. May be called multiple times, up to an internal safety cap.
     ///
     /// # Example
     ///
@@ -172,17 +228,30 @@ impl MinimalLoggerConfig {
     /// ).expect("logger init failed");
     /// ```
     pub fn filter(mut self, target: impl Into<String>, level: LevelFilter) -> Self {
-        self.filters
-            .get_or_insert_with(Vec::new)
-            .push((target.into(), level));
+        let target = target.into();
+        if target.len() > MAX_FILTER_TARGET_LEN {
+            eprintln!(
+                "[minimal_logger] Filter target {:?} exceeds max {MAX_FILTER_TARGET_LEN} bytes — skipping",
+                target
+            );
+            return self;
+        }
+
+        let filters = self.filters.get_or_insert_with(Vec::new);
+        if filters.len() >= MAX_FILTERS {
+            eprintln!("[minimal_logger] Filter count exceeds max {MAX_FILTERS} — skipping");
+            return self;
+        }
+        filters.push((target, level));
         self
     }
 
     /// Write log output to a file at `path` (created with `O_APPEND` if absent).
     ///
     /// The path is resolved to an absolute path when the configuration is applied
-    /// (inside [`init()`] or [`reinit()`]). If the file cannot be opened, a
-    /// diagnostic is printed to stderr and output falls back to stderr.
+    /// (inside [`init()`] or [`reinit()`]). On Unix, newly created files use
+    /// owner-only permissions subject to the process umask. If the file cannot
+    /// be opened, a diagnostic is printed to stderr and output falls back to stderr.
     pub fn file(mut self, path: impl Into<PathBuf>) -> Self {
         self.file = Some(FileTarget::Path(path.into()));
         self
@@ -199,9 +268,10 @@ impl MinimalLoggerConfig {
     /// Set the per-thread [`BufWriter`] capacity in bytes (default: 4096).
     ///
     /// The new capacity takes effect the next time a thread's writer is
-    /// recreated (on first use or after a log-file rotation).
+    /// recreated (on first use or after a log-file rotation). Values above the
+    /// internal safety cap are clamped.
     pub fn buf_capacity(mut self, bytes: usize) -> Self {
-        self.buf_capacity = Some(bytes);
+        self.buf_capacity = Some(bounded_buf_capacity(bytes));
         self
     }
 
@@ -209,9 +279,10 @@ impl MinimalLoggerConfig {
     ///
     /// A background thread wakes every `ms` milliseconds and sets a flag that
     /// causes the next log call on any thread to flush its buffer. Set to `0`
-    /// to flush on every log record.
+    /// to flush on every log record without spawning a background thread. Values
+    /// above the internal safety cap are clamped.
     pub fn flush_ms(mut self, ms: u64) -> Self {
-        self.flush_ms = Some(ms);
+        self.flush_ms = Some(bounded_flush_ms(ms));
         self
     }
 
@@ -223,8 +294,11 @@ impl MinimalLoggerConfig {
     /// and `}}` for literal brace characters.
     ///
     /// Default: `{timestamp} [{level:<5}] T[{thread_name}] [{file}:{line}] {args}`
+    ///
+    /// Very large templates and field widths are bounded to avoid unexpectedly
+    /// large per-record allocations.
     pub fn format(mut self, template: impl Into<String>) -> Self {
-        self.format = Some(template.into());
+        self.format = Some(bounded_format_template(template.into()));
         self
     }
 
@@ -280,6 +354,7 @@ impl MinimalLoggerConfig {
     /// that resolves to the compile-time default (4096 B buffer, 1 s flush, built-in
     /// format, stderr output); on [`reinit()`] it preserves the currently active value.
     /// Invalid `RUST_LOG` directives are skipped with a warning on stderr.
+    /// Oversized values are clamped or replaced with safe defaults.
     ///
     /// # Example
     ///
@@ -298,26 +373,46 @@ impl MinimalLoggerConfig {
 
         let buf_capacity = std::env::var("RUST_LOG_BUFFER_SIZE")
             .ok()
-            .and_then(|s| s.parse().ok());
+            .and_then(|s| s.parse().ok())
+            .map(bounded_buf_capacity);
 
         let flush_ms = std::env::var("RUST_LOG_FLUSH_MS")
             .ok()
-            .and_then(|s| s.parse().ok());
+            .and_then(|s| s.parse().ok())
+            .map(bounded_flush_ms);
 
-        let format = std::env::var("RUST_LOG_FORMAT").ok();
+        let format = std::env::var("RUST_LOG_FORMAT")
+            .ok()
+            .map(bounded_format_template);
 
         let mut level: Option<LevelFilter> = None;
         let mut filters: Vec<(String, LevelFilter)> = Vec::new();
 
         for directive in rust_log.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             match directive.split_once('=') {
-                Some((target, level_str)) => match level_str.trim().parse::<LevelFilter>() {
-                    Ok(l) => filters.push((target.trim().to_string(), l)),
-                    Err(_) => eprintln!(
-                        "[minimal_logger] RUST_LOG: unknown level {:?} — skipping",
-                        level_str
-                    ),
-                },
+                Some((target, level_str)) => {
+                    let target = target.trim();
+                    if filters.len() >= MAX_FILTERS {
+                        eprintln!(
+                            "[minimal_logger] RUST_LOG: too many filters — ignoring remaining"
+                        );
+                        break;
+                    }
+                    if target.len() > MAX_FILTER_TARGET_LEN {
+                        eprintln!(
+                            "[minimal_logger] RUST_LOG: filter target {:?} exceeds max {MAX_FILTER_TARGET_LEN} bytes — skipping",
+                            target
+                        );
+                        continue;
+                    }
+                    match level_str.trim().parse::<LevelFilter>() {
+                        Ok(l) => filters.push((target.to_string(), l)),
+                        Err(_) => eprintln!(
+                            "[minimal_logger] RUST_LOG: unknown level {:?} — skipping",
+                            level_str
+                        ),
+                    }
+                }
                 None => match directive.parse::<LevelFilter>() {
                     Ok(l) => level = Some(l),
                     Err(_) => eprintln!(
@@ -381,20 +476,22 @@ impl MinimalLoggerConfig {
             None => current.and_then(|c| c.file_path.clone()),
         };
 
-        let buf_capacity = self
-            .buf_capacity
-            .unwrap_or_else(|| current.map_or(DEFAULT_BUF_CAPACITY, |c| c.buf_capacity));
+        let buf_capacity = bounded_buf_capacity(
+            self.buf_capacity
+                .unwrap_or_else(|| current.map_or(DEFAULT_BUF_CAPACITY, |c| c.buf_capacity)),
+        );
 
-        let flush_ms = self
-            .flush_ms
-            .unwrap_or_else(|| current.map_or(DEFAULT_FLUSH_MS, |c| c.flush_ms));
+        let flush_ms = bounded_flush_ms(
+            self.flush_ms
+                .unwrap_or_else(|| current.map_or(DEFAULT_FLUSH_MS, |c| c.flush_ms)),
+        );
 
-        let format_template = self.format.unwrap_or_else(|| {
+        let format_template = bounded_format_template(self.format.unwrap_or_else(|| {
             current.map_or_else(
                 || DEFAULT_LOG_FORMAT.to_string(),
                 |c| c.format_template.clone(),
             )
-        });
+        }));
 
         ReloadConfig {
             default_level,
@@ -527,7 +624,7 @@ impl LogFormat {
                     }
 
                     let mut token = String::new();
-                    while let Some(next) = chars.next() {
+                    for next in chars.by_ref() {
                         if next == '}' {
                             break;
                         }
@@ -616,22 +713,22 @@ fn parse_placeholder(token: &str) -> FormatPiece {
 /// Accepts `<N` (left-align, width N) and `>N` (right-align, width N).
 /// Returns a zero-width, left-aligned spec for unrecognised or empty input.
 fn parse_format_spec(spec: &str) -> FormatSpec {
-    if let Some(width_text) = spec.strip_prefix('<') {
-        if let Ok(width) = width_text.parse::<usize>() {
-            return FormatSpec {
-                align: Align::Left,
-                width: Some(width),
-            };
-        }
+    if let Some(width_text) = spec.strip_prefix('<')
+        && let Ok(width) = width_text.parse::<usize>()
+    {
+        return FormatSpec {
+            align: Align::Left,
+            width: Some(bounded_format_width(width)),
+        };
     }
 
-    if let Some(width_text) = spec.strip_prefix('>') {
-        if let Ok(width) = width_text.parse::<usize>() {
-            return FormatSpec {
-                align: Align::Right,
-                width: Some(width),
-            };
-        }
+    if let Some(width_text) = spec.strip_prefix('>')
+        && let Ok(width) = width_text.parse::<usize>()
+    {
+        return FormatSpec {
+            align: Align::Right,
+            width: Some(bounded_format_width(width)),
+        };
     }
 
     FormatSpec {
@@ -715,8 +812,8 @@ fn write_field(out: &mut String, field: LogField, spec: FormatSpec, record: &Rec
         LogField::File => {
             write_padded(out, record.file().unwrap_or_default(), spec);
         }
-        LogField::Line => match record.line() {
-            Some(n) => {
+        LogField::Line => {
+            if let Some(n) = record.line() {
                 if spec.width.is_none() {
                     let _ = write!(out, "{n}");
                 } else {
@@ -724,7 +821,6 @@ fn write_field(out: &mut String, field: LogField, spec: FormatSpec, record: &Rec
                     write_padded(out, &s, spec);
                 }
             }
-            None => {}
-        },
+        }
     }
 }
