@@ -15,9 +15,9 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use log::{Log, Metadata, Record};
 
 use crate::{
-    FLUSH_FLAG, MinimalLoggerConfig, REOPEN_FLAG,
+    MinimalLoggerConfig, REOPEN_FLAG,
     config::{ActiveConfig, ReloadConfig},
-    log_file::{LogFile, flush_and_clear_thread_writer, with_thread_writer, write_record},
+    log_file::{LogFile, flush_and_clear_thread_writer, write_record},
     native::platform,
     report_io_error, shutdown,
 };
@@ -41,7 +41,7 @@ pub(crate) static LOGGER: OnceLock<&'static MinimalLogger> = OnceLock::new();
 /// Guards one-time process setup: the rotation signal handler and the panic flush hook.
 static RUNTIME_INIT: Once = Once::new();
 
-/// A background thread that periodically sets `FLUSH_FLAG` to trigger buffered writes.
+/// A background thread that periodically flushes shared buffered file output.
 ///
 /// Replaced (stopped + joined + respawned) when `RUST_LOG_FLUSH_MS` changes;
 /// stopped and joined during [`shutdown()`].
@@ -53,7 +53,7 @@ pub(crate) struct FlushWorker {
 }
 
 impl FlushWorker {
-    /// Spawn a flush worker that sets `FLUSH_FLAG` every `flush_ms` milliseconds.
+    /// Spawn a flush worker that flushes file buffers every `flush_ms` milliseconds.
     ///
     /// When `flush_ms == 0` no thread is spawned; per-record flushing is handled
     /// synchronously by `write_record`. This prevents a tight busy-spin that
@@ -62,8 +62,6 @@ impl FlushWorker {
     /// If the thread cannot be spawned, prints a warning to stderr and returns a
     /// no-op worker; periodic flushing will be disabled for that interval.
     fn spawn(flush_ms: u64) -> Self {
-        FLUSH_FLAG.store(false, Ordering::Relaxed);
-
         if flush_ms == 0 {
             return FlushWorker {
                 stop_tx: None,
@@ -81,7 +79,11 @@ impl FlushWorker {
                 loop {
                     match stop_rx.recv_timeout(interval) {
                         Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                        Err(RecvTimeoutError::Timeout) => FLUSH_FLAG.store(true, Ordering::Release),
+                        Err(RecvTimeoutError::Timeout) => {
+                            if let Some(logger) = LOGGER.get().copied() {
+                                logger.flush_file_buffers();
+                            }
+                        }
                     }
                 }
             })
@@ -201,11 +203,18 @@ impl MinimalLogger {
         }
     }
 
+    /// Flush the active file buffer, if file output is enabled.
+    pub(crate) fn flush_file_buffers(&self) {
+        if let Some(file) = self.file.load_full() {
+            file.flush();
+        }
+    }
+
     /// Signal the flush worker to exit and wait for it to finish.
     ///
-    /// Called by [`shutdown()`] so that no further `FLUSH_FLAG` stores can
-    /// race with the process tearing down.
+    /// Called by [`shutdown()`] during process teardown.
     pub(crate) fn stop_flush_worker(&self) {
+        self.flush_file_buffers();
         if let Ok(mut worker) = self.flush_worker.lock() {
             worker.stop();
         }
@@ -294,6 +303,7 @@ impl MinimalLogger {
 
 impl Drop for MinimalLogger {
     fn drop(&mut self) {
+        self.flush_file_buffers();
         match self.flush_worker.get_mut() {
             Ok(worker) => worker.stop(),
             Err(poisoned) => poisoned.into_inner().stop(),
@@ -397,19 +407,14 @@ impl Log for MinimalLogger {
         match self.file.load_full() {
             Some(arc) => write_record(record, arc, buf_capacity, flush_every_record, &format),
             None => {
-                // If this thread used to write to a file, flush and drop its
-                // stale thread-local writer before switching to stderr output.
                 flush_and_clear_thread_writer();
 
                 let stderr = std::io::stderr();
                 let mut out = stderr.lock();
-                let flush_requested = FLUSH_FLAG.swap(false, Ordering::Acquire);
                 if let Err(err) = out.write_all(format.render(record).as_bytes()) {
                     report_io_error("write log record to stderr", &err);
                 }
-                if (flush_requested || flush_every_record)
-                    && let Err(err) = out.flush()
-                {
+                if flush_every_record && let Err(err) = out.flush() {
                     report_io_error("flush stderr", &err);
                 }
             }
@@ -417,14 +422,7 @@ impl Log for MinimalLogger {
     }
 
     fn flush(&self) {
-        // Flush calling thread's BufWriter.
-        // bw.flush() → FileWriter::write(buffered_bytes) → write() / WriteFile()
-        // FileWriter::flush() → no-op
-        with_thread_writer(|bw| {
-            if let Err(err) = bw.flush() {
-                report_io_error("flush buffered log records", &err);
-            }
-        });
+        self.flush_file_buffers();
         if let Err(err) = std::io::stderr().lock().flush() {
             report_io_error("flush stderr", &err);
         }

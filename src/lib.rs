@@ -103,10 +103,10 @@
 //! 1. [`init()`] registers the global logger and starts the flush worker thread
 //!    when the configured flush interval is non-zero.
 //! 2. Log macros (`info!`, `debug!`, …) render one log line and write it into
-//!    the calling thread's `BufWriter`.
+//!    a shared buffered file writer (or stderr when file output is disabled).
 //! 3. [`reinit()`] applies a new [`MinimalLoggerConfig`] and updates only the subsystems
 //!    whose effective configuration changed.
-//! 4. [`shutdown()`] flushes the calling thread's buffered writer to the kernel.
+//! 4. [`shutdown()`] flushes active buffered output before exit.
 //!
 //! # Runtime reconfiguration
 //!
@@ -124,20 +124,19 @@
 //! Only the components whose resolved value actually changed are updated:
 //!
 //! - **Filters / max level** — recomputed and applied via `log::set_max_level`.
-//! - **Output file** — new file opened; old thread-local writers flush before
-//!   switching destinations and the old descriptor closes after the last writer drops.
+//! - **Output file** — destination swapped atomically; the previous writer is
+//!   flushed/synced before close.
 //! - **Flush interval** — old worker thread stopped and joined; new one spawned.
 //! - **Format template** — new parsed template swapped in atomically.
-//! - **Buffer size** — applied the next time a thread-local writer is recreated.
+//! - **Buffer size** — applied to newly opened log files.
 //!
 //! # Flush model
 //!
 //! | Trigger      | Mechanism                                                       |
 //! |--------------|-----------------------------------------------------------------|
 //! | Buffer full  | `BufWriter` flushes automatically on the next `write_all` call  |
-//! | Periodic     | Background worker sets a flag; next log call calls `bw.flush()` |
-//! | Thread exit  | `BufWriter::drop()` calls `flush()` automatically               |
-//! | Explicit     | [`shutdown()`] or `Log::flush()` flushes the calling thread     |
+//! | Periodic     | Background worker flushes the active shared file buffer         |
+//! | Explicit     | [`shutdown()`] or `Log::flush()` flushes the active buffer      |
 //!
 //! # Log rotation
 //!
@@ -147,10 +146,8 @@
 //! | Other Unix     | `SIGHUP`                                  |
 //! | Windows        | `Local\RustLogger_LogRotate` named event |
 //!
-//! When rotation fires, each thread detects the new file on its next log call via
-//! an `Arc` pointer comparison: it flushes buffered bytes to the old file descriptor,
-//! then creates a new `BufWriter` pointing to the freshly opened file. The old
-//! descriptor is closed once no thread holds a reference to it.
+//! When rotation fires, the logger opens a new file and atomically swaps the
+//! active writer. The old writer is flushed and synced before close.
 
 mod config;
 mod log_file;
@@ -172,19 +169,14 @@ use crate::{
 // Atomic flags
 //
 // REOPEN_FLAG : set by platform signal/event → triggers LogFile swap in log().
-// FLUSH_FLAG  : set by background thread → triggers bw.flush() in write_record().
 //
-// REOPEN_FLAG is checked only in Log::log(), not inside write_record().
-// Rotation is additionally detected per-thread via Arc::ptr_eq() so threads
-// that were mid-write when the swap happened catch up on their next log call.
+// REOPEN_FLAG is checked in Log::log() and handled by reopening/switching the
+// shared active file writer.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Set by the platform rotation handler (`SIGHUP` / named event) to request
 /// a log file reopen on the next `Log::log` call.
 static REOPEN_FLAG: AtomicBool = AtomicBool::new(false);
-/// Set by the background flush worker to request a `bw.flush()` call inside
-/// `write_record` before the next record is written.
-static FLUSH_FLAG: AtomicBool = AtomicBool::new(false);
 /// Ensures repeated I/O failures do not recursively flood stderr.
 static IO_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 
@@ -214,7 +206,7 @@ pub(crate) fn report_io_error(context: &str, err: &std::io::Error) {
 ///
 /// The first successful call also installs:
 /// - A platform rotation handler (`SIGHUP` on Unix; a named event on Windows).
-/// - A panic hook that flushes the calling thread's buffer before the process unwinds.
+/// - A panic hook that flushes active buffered output before the process unwinds.
 pub fn init(config: MinimalLoggerConfig) -> Result<(), SetLoggerError> {
     if let Some(logger) = LOGGER.get().copied() {
         return log::set_logger(logger);
@@ -256,10 +248,10 @@ pub fn init(config: MinimalLoggerConfig) -> Result<(), SetLoggerError> {
 /// | Changed setting          | Effect                                                  |
 /// |--------------------------|---------------------------------------------------------|
 /// | `.level()` / `.filter()` | Log filters and max level updated atomically            |
-/// | `.file()` / `.stderr()`  | Destination swapped; old thread-local writers flush on switch |
+/// | `.file()` / `.stderr()`  | Destination swapped; old writer flushed/synced on switch |
 /// | `.flush_ms()`            | Old flush worker stopped and joined; new worker spawned |
 /// | `.format()`              | Format template swapped atomically                      |
-/// | `.buf_capacity()`        | Applied when a thread-local writer is next recreated    |
+/// | `.buf_capacity()`        | Applied when a new file writer is opened                |
 ///
 /// If the logger has not yet been initialised this function behaves like
 /// [`init()`] with the supplied `config`, discarding any initialisation error.
@@ -277,12 +269,10 @@ pub fn reinit(config: MinimalLoggerConfig) {
     }
 }
 
-/// Flush the calling thread's buffered writer to the kernel and stop the
-/// background flush worker.
+/// Flush active buffered output and stop the background flush worker.
 ///
 /// Call this near process exit to ensure all buffered log records are written
-/// and the flush worker thread has exited cleanly. Other threads' writers are
-/// flushed automatically when those threads exit via `BufWriter::drop()`.
+/// and the flush worker thread has exited cleanly.
 ///
 /// This function does not close the log file descriptor; the OS releases it
 /// when the process exits.

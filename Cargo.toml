@@ -6,7 +6,7 @@ authors = [
     "GitHub Copilot <copilot@github.com>",
     "Anthropic Claude <claude@anthropic.com>",
 ]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A minimal-resource, platform-native logger for Rust applications."
 readme = "README.md"

@@ -208,10 +208,6 @@ fn flush_ms_zero_does_not_spawn_background_thread() {
         !worker.has_handle(),
         "flush_ms=0 must not spawn a background thread"
     );
-    assert!(
-        !crate::FLUSH_FLAG.load(Ordering::Relaxed),
-        "flush_ms=0 should not depend on the periodic flush flag"
-    );
 }
 
 #[test]
@@ -275,6 +271,39 @@ fn reconfiguring_to_stderr_flushes_current_thread_file_buffer() {
     logger.apply_reload(reload);
 
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "before-stderr\n");
+    drop(logger);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn flush_file_buffers_drain_records_from_other_threads() {
+    let path = temp_log_path("cross_thread_flush");
+    let logger = std::sync::Arc::new(crate::logger::MinimalLogger::from_config(
+        MinimalLoggerConfig::new()
+            .file(&path)
+            .format("{args}")
+            .buf_capacity(1024)
+            .flush_ms(MAX_FLUSH_MS),
+    ));
+
+    let worker_logger = std::sync::Arc::clone(&logger);
+    let worker = std::thread::spawn(move || {
+        let record = Record::builder()
+            .args(format_args!("from-worker"))
+            .level(Level::Info)
+            .target("t")
+            .module_path_static(Some("minimal_logger::tests"))
+            .file_static(Some("f"))
+            .line(Some(1))
+            .build();
+        worker_logger.log(&record);
+    });
+
+    worker.join().expect("worker log thread should complete");
+
+    logger.flush_file_buffers();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "from-worker\n");
+
     drop(logger);
     let _ = std::fs::remove_file(path);
 }

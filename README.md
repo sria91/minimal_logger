@@ -6,7 +6,7 @@ reconfiguration via a builder API.
 
 ## Features
 
-- Thread-local buffered logging with `BufWriter`
+- Shared buffered file logging with `BufWriter`
 - Platform-specific log rotation
   - Linux / macOS: `SIGHUP`
   - Windows: `Local\\RustLogger_LogRotate` named event
@@ -66,7 +66,7 @@ configuration changed:
 - output destination (`.file()` / `.stderr()`)
 - periodic flush worker interval (`.flush_ms()`)
 - rendering format (`.format()`)
-- per-thread buffer capacity for newly recreated writers (`.buf_capacity()`)
+- buffer capacity for newly opened file writers (`.buf_capacity()`)
 
 Unset fields keep their **current** value — you can change a single subsystem
 without repeating the full configuration. If nothing changed, `reinit()` returns
@@ -94,7 +94,7 @@ fn reconfigure() {
 | `.filter(t, l)`    | *(none)*          | Per-target level override; may be called many times  |
 | `.file(path)`      | *(stderr)*        | Append log records to a file (`O_APPEND`)            |
 | `.stderr()`        | *(default)*       | Explicitly route output back to stderr               |
-| `.buf_capacity(n)` | `4096`            | Per-thread `BufWriter` capacity in bytes             |
+| `.buf_capacity(n)` | `4096`            | Shared file `BufWriter` capacity in bytes            |
 | `.flush_ms(ms)`    | `1000`            | Periodic flush interval; `0` flushes every record     |
 | `.format(tmpl)`    | *see below*       | Log-line template with `{field}` placeholders        |
 
@@ -157,10 +157,9 @@ gap in output and no lost bytes.
 | Other Unix    | `SIGHUP`                                  |
 | Windows       | `Local\RustLogger_LogRotate` named event |
 
-When the signal fires, each thread detects the new file on its **next log call**
-via an `Arc` pointer comparison: it flushes its buffered bytes to the old file
-descriptor, then creates a new `BufWriter` pointing to the freshly opened file.
-The old file descriptor is closed once no thread holds a reference to it.
+When the signal fires, the logger opens a new file and atomically swaps the
+active writer. Buffered output on the old writer is flushed and synced before
+the old descriptor is closed.
 
 Example logrotate configuration (Linux):
 
@@ -181,7 +180,7 @@ Example logrotate configuration (Linux):
 | `init(MinimalLoggerConfig)`     | Register the logger and start the flush worker when needed. Call once at startup. |
 | `reinit(MinimalLoggerConfig)`   | Apply a new config; update only changed subsystems.               |
 | `config_from_env()`             | Build a `MinimalLoggerConfig` from `RUST_LOG*` environment variables. |
-| `shutdown()`                    | Flush the calling thread's buffered writer before process exit.    |
+| `shutdown()`                    | Flush active buffered output before process exit.                  |
 
 ## Cargo metadata
 
