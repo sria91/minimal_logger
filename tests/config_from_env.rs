@@ -295,7 +295,7 @@ fn rust_log_format_huge_template_uses_default() {
     let cfg = minimal_logger::MinimalLoggerConfig::from_env();
     assert_eq!(
         cfg.get_format(),
-        Some("{timestamp} [{level:<5}] T[{thread_name}] [{file}:{line}] {args}")
+        Some("{timestamp} [{level:<5}] T[{thread_name}] [{target}] {args}")
     );
 }
 

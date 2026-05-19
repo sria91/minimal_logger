@@ -143,7 +143,7 @@ Width and alignment: `{level:<5}` left-aligns in a field of width 5;
 Default format string:
 
 ```text
-{timestamp} [{level:<5}] T[{thread_name}] [{file}:{line}] {args}
+{timestamp} [{level:<5}] T[{thread_name}] [{target}] {args}
 ```
 
 ## Log rotation

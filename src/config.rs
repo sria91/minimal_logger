@@ -17,7 +17,7 @@ pub(crate) const DEFAULT_FLUSH_MS: u64 = 1_000;
 pub(crate) const MAX_FLUSH_MS: u64 = 60 * 60 * 1_000;
 /// Default log-line template used when `RUST_LOG_FORMAT` is not set.
 pub(crate) const DEFAULT_LOG_FORMAT: &str =
-    "{timestamp} [{level:<5}] T[{thread_name}] [{file}:{line}] {args}";
+    "{timestamp} [{level:<5}] T[{thread_name}] [{target}] {args}";
 /// Maximum accepted log-line format template length, in bytes.
 pub(crate) const MAX_FORMAT_TEMPLATE_LEN: usize = 8 * 1024;
 /// Maximum accepted width for a single formatted field.
@@ -293,7 +293,7 @@ impl MinimalLoggerConfig {
     /// `line`, `args`. Width/alignment follows `{level:<5}` syntax. Use `{{`
     /// and `}}` for literal brace characters.
     ///
-    /// Default: `{timestamp} [{level:<5}] T[{thread_name}] [{file}:{line}] {args}`
+    /// Default: `{timestamp} [{level:<5}] T[{thread_name}] [{target}] {args}`
     ///
     /// Very large templates and field widths are bounded to avoid unexpectedly
     /// large per-record allocations.

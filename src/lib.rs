@@ -95,7 +95,7 @@
 //!
 //! Default format string:
 //! ```text
-//! {timestamp} [{level:<5}] T[{thread_name}] [{file}:{line}] {args}
+//! {timestamp} [{level:<5}] T[{thread_name}] [{target}] {args}
 //! ```
 //!
 //! # Lifecycle
